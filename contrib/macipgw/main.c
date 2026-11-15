@@ -54,6 +54,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <syslog.h>
+#include <strings.h>
+#include <time.h>
 #include <fcntl.h>
 #include <sys/ioctl.h>
 #include <sysexits.h>
@@ -63,10 +65,14 @@
 #include "macip.h"
 #include "tunnel.h"
 #include "util.h"
+#include "lan.h"
 
 int atsocket;
 int tundev;
 int debug = 0;
+
+static int gLanMode = 0;
+static struct lan_config gLanCfg;
 static char	*version = VERSION;
 
 static void die(int n)
@@ -78,7 +84,12 @@ static void die(int n)
     }
 
     macip_close();
-    tunnel_close();
+
+    if (gLanMode) {
+        lan_close();
+    } else {
+        tunnel_close();
+    }
 
     if (gDebug) {
         fprintf(stderr, "\nstopped.\n");
@@ -88,12 +99,20 @@ static void die(int n)
 }
 
 
+static long mono_now(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
+}
+
 static void server(void)
 {
     fd_set fds;
     int maxfd = 0;
     struct timeval tv;
     int i;
+    long last_macip_idle = mono_now(), last_lan_idle = mono_now();
     maxfd = atsocket;
     maxfd = MAX(maxfd, tundev);
     maxfd++;
@@ -102,42 +121,53 @@ static void server(void)
         FD_ZERO(&fds);
         FD_SET(atsocket, &fds);
         FD_SET(tundev, &fds);
-        tv.tv_sec = 2;
+        tv.tv_sec = gLanMode ? 1 : 2;
         tv.tv_usec = 0;
 
-        if (gDebug) {
+        if (gDebug & ~DEBUG_LAN) {
             printf("waiting for packet: ");
             fflush(stdout);
         }
 
         if ((i = select(maxfd, &fds, 0, 0, &tv)) > 0) {
             if (FD_ISSET(atsocket, &fds)) {
-                if (gDebug) {
+                if (gDebug & ~DEBUG_LAN) {
                     printf("got AT packet.\n");
                 }
 
                 macip_input();
-            } else if (FD_ISSET(tundev, &fds)) {
-                if (gDebug)
-                    printf
-                    ("got IP packet from tunnel.\n");
-
-                tunnel_input();
             }
-        } else {
-            printf("\r");
 
-            if (i == 0) {
-                macip_idle();
-            } else {
-                if (gDebug) {
-                    perror("select");
+            if (FD_ISSET(tundev, &fds)) {
+                if (gLanMode) {
+                    lan_input();
+                } else {
+                    if (gDebug)
+                        printf
+                        ("got IP packet from tunnel.\n");
+
+                    tunnel_input();
                 }
             }
+        } else if (i < 0 && errno != EINTR && gDebug) {
+            perror("select");
+        }
+
+        /* In tunnel mode housekeeping used to run only when the network was
+           idle; on a LAN there is always traffic, so run it on a timer. */
+        long n = mono_now();
+
+        if (gLanMode && n - last_lan_idle >= 1) {
+            lan_idle();
+            last_lan_idle = n;
+        }
+
+        if (n - last_macip_idle >= 2) {
+            macip_idle();
+            last_macip_idle = n;
         }
     }
 }
-
 
 void disassociate(void)
 {
@@ -199,6 +229,41 @@ struct passwd *get_user(const char *username)
     return pwd;
 }
 
+/*!
+ * [clients] section: identity key, IP address or "node N.N" = MAC
+ */
+static void read_clients(INIPARSER_DICTIONARY *config)
+{
+    int n = iniparser_getsecnkeys(config, "clients");
+    const char **keys;
+
+    if (n <= 0) {
+        return;
+    }
+
+    if ((keys = calloc(n, sizeof(char *))) == NULL) {
+        return;
+    }
+
+    iniparser_getseckeys(config, "clients", keys);
+
+    for (int i = 0; i < n && gLanCfg.noverrides < LAN_MAX_OVERRIDES; i++) {
+        const char *val = iniparser_getstring(config, keys[i], "");
+        struct lan_override *o = &gLanCfg.overrides[gLanCfg.noverrides];
+        const char *k = keys[i] + strlen("clients:");
+
+        if (lan_parse_mac(val, o->mac) < 0) {
+            fprintf(stderr, "macipgw: [clients] %s: bad MAC '%s'\n", k, val);
+            continue;
+        }
+
+        snprintf(o->key, sizeof(o->key), "%s", k);
+        gLanCfg.noverrides++;
+    }
+
+    free(keys);
+}
+
 macip_options *read_options(const char *conf)
 {
     dictionary *config;
@@ -215,6 +280,16 @@ macip_options *read_options(const char *conf)
     options->zone = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL, "zone", "");
     options->unprivileged_user = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL,
                                                      "unprivileged user", "");
+    options->mode = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL, "mode", "tun");
+    options->bridge = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL, "bridge", "br0");
+    options->mac_prefix = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL,
+                                              "mac prefix", "08:00:07");
+    options->router = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL, "router", "");
+    options->announce_interval = iniparser_getint(config,
+                                 INISEC_GLOBAL ":announce interval", 60);
+    options->identify_timeout = iniparser_getint(config,
+                                INISEC_GLOBAL ":identify timeout", 3);
+    read_clients(config);
     iniparser_freedict(config);
     return options;
 }
@@ -325,6 +400,25 @@ int main(int argc, char *argv[])
             zone = mio->zone;
         }
 
+        if (strcasecmp(mio->mode, "lan") == 0) {
+            gLanMode = 1;
+            snprintf(gLanCfg.bridge, sizeof(gLanCfg.bridge), "%s", mio->bridge);
+            gLanCfg.announce_interval = mio->announce_interval;
+            gLanCfg.identify_timeout = mio->identify_timeout;
+            gLanCfg.router = mio->router[0] ? atoip(mio->router) : 0;
+            uint8_t m[6];
+            char pfx[32];
+            snprintf(pfx, sizeof(pfx), "%s:00:00:00", mio->mac_prefix);
+
+            if (lan_parse_mac(pfx, m) < 0) {
+                usage("mac prefix must look like 08:00:07");
+            }
+
+            memcpy(gLanCfg.prefix, m, 3);
+        } else if (strcasecmp(mio->mode, "tun") != 0) {
+            usage("mode must be tun or lan");
+        }
+
         if ((mio->unprivileged_user[0] != '\0') && (pwd == NULL)) {
             if (gDebug & DEBUG_MACIP) {
                 printf("set unprivileged_user to %s\n", mio->unprivileged_user);
@@ -366,14 +460,25 @@ int main(int argc, char *argv[])
         disassociate();
     }
 
-    tundev = tunnel_open(net, mask, macip_output);
+    if (gLanMode) {
+        struct macip_hooks hooks = {
+            .client_seen = lan_client_seen,
+            .client_gone = lan_client_gone,
+            .nbp_entry = lan_nbp_entry,
+        };
+        macip_set_hooks(&hooks);
+        tundev = lan_open(&gLanCfg, net + 1, macip_output);
+    } else {
+        tundev = tunnel_open(net, mask, macip_output);
+    }
 
     if (tundev < 0) {
         syslog(LOG_ERR, "could not open tunnel.\n");
         die(EX_OSERR);
     }
 
-    atsocket = macip_open(zone, net, mask, ns, tunnel_output);
+    atsocket = macip_open(zone, net, mask, ns,
+                          gLanMode ? lan_output : tunnel_output);
 
     if (atsocket < 0) {
         syslog(LOG_ERR, "could not initialise MacIP\n");
@@ -412,6 +517,11 @@ int main(int argc, char *argv[])
         if (mio->unprivileged_user) {
             CONFIG_ARG_FREE(mio->unprivileged_user)
         }
+
+        CONFIG_ARG_FREE(mio->mode)
+        CONFIG_ARG_FREE(mio->bridge)
+        CONFIG_ARG_FREE(mio->mac_prefix)
+        CONFIG_ARG_FREE(mio->router)
     }
 
     server();

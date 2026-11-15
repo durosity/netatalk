@@ -28,11 +28,13 @@ extern int gDebug;
 
 #if defined(DEBUG)
 #define DEBUG_MACIP		(0x0001)
+#define DEBUG_LAN		(0x0002)
 #define DEBUG_ROUTE		(0x0010)
 #define DEBUG_TUNNEL	(0x0100)
 #define DEBUG_TUNDEV	(0x0200)
 #else
 #define DEBUG_MACIP		(0)
+#define DEBUG_LAN		(0)
 #define DEBUG_ROUTE		(0)
 #define DEBUG_TUNNEL	(0)
 #define DEBUG_TUNDEV	(0)

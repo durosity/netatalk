@@ -31,6 +31,12 @@ typedef struct {
     char *nameserver;
     char *zone;
     char *unprivileged_user;
+    char *mode;                 /* "tun" (default) or "lan" */
+    char *bridge;               /* LAN mode: bridge holding the LAN port */
+    char *mac_prefix;           /* LAN mode: OUI for generated MACs */
+    char *router;               /* LAN mode: next hop, default route if empty */
+    int announce_interval;      /* LAN mode: seconds between announcements */
+    int identify_timeout;       /* LAN mode: seconds to wait for NBP names */
 } macip_options;
 
 macip_options *read_options(const char *);

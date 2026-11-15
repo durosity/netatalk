@@ -30,3 +30,16 @@ extern void macip_idle(void);
 extern void macip_output(char *buffer, int len);
 extern void macip_input(void);
 
+struct sockaddr_at;
+struct nbpnve;
+
+/*! callbacks used by LAN mode; any may be NULL */
+struct macip_hooks {
+    void (*client_seen)(uint32_t ip, const struct sockaddr_at *sat);
+    void (*client_gone)(uint32_t ip);
+    void (*nbp_entry)(const struct nbpnve *nve);
+};
+
+extern void macip_set_hooks(const struct macip_hooks *h);
+extern void macip_nbp_lookup(char *obj, char *type);
+

@@ -13,7 +13,7 @@ macipgw_sources = [
 ]
 
 if host_os == 'linux'
-    macipgw_sources += 'tunnel_linux.c'
+    macipgw_sources += ['tunnel_linux.c', 'lan_linux.c']
 else
     macipgw_sources += 'tunnel_bsd.c'
 endif

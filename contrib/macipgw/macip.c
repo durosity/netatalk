@@ -44,6 +44,7 @@
 #include <string.h>
 #include <netdb.h>
 #include <errno.h>
+#include <syslog.h>
 
 #include <netinet/in_systm.h>
 #include <netinet/in.h>
@@ -127,6 +128,7 @@ struct macip_data {
     char name[32];
     char type[32];
     char zone[32];
+    int ipaddr_registered;
 };
 
 #define IPADDR(e) (e - gMacip.ipent + gMacip.net + 1)
@@ -139,6 +141,7 @@ struct zones {
 };
 
 static struct macip_data gMacip;
+static struct macip_hooks gHooks;
 static struct zones gZones;
 static outputfunc_t gOutput;
 
@@ -282,6 +285,10 @@ static void arp_set(uint32_t ip, struct sockaddr_at *sat)
             printf("arp_set: %s -> %d.%d\n", iptoa(ip),
                    ntohs(sat->sat_addr.s_net),
                    sat->sat_addr.s_node);
+
+        if (gHooks.client_seen && ip != gMacip.addr) {
+            gHooks.client_seen(ip, sat);
+        }
     }
 }
 
@@ -301,6 +308,10 @@ static void arp_input(struct sockaddr_at *sat, char *buffer, int len)
                    nve->nn_objlen, nve->nn_obj,
                    nve->nn_typelen, nve->nn_type,
                    nve->nn_zonelen, nve->nn_zone);
+
+        if (gHooks.nbp_entry) {
+            gHooks.nbp_entry(nve);
+        }
 
         if (nve->nn_typelen != MACIP_NODETYPE_LEN ||
                 strncasecmp(nve->nn_type, MACIP_NODETYPE,
@@ -735,6 +746,10 @@ void macip_idle(void)
             } else {
                 e->assigned = ASSIGN_FREE;
 
+                if (gHooks.client_gone) {
+                    gHooks.client_gone(IPADDR(e));
+                }
+
                 if (gDebug & DEBUG_MACIP)
                     printf
                     ("macip_idle: arp entry %s/%d.%d free'd.\n",
@@ -815,6 +830,16 @@ macip_open(char *zone, uint32_t net, uint32_t mask, uint32_t ns,
         printf("done.\n");
     }
 
+    /* Some clients (Open Transport configured manually) look their router
+       up as IPADDRESS rather than IPGATEWAY. */
+    if (nbp_rgstr(atp_sockaddr(gMacip.atp), gMacip.name, MACIP_NODETYPE,
+                  gMacip.zone) < 0) {
+        syslog(LOG_WARNING, "could not register %s:%s@%s", gMacip.name,
+               MACIP_NODETYPE, gMacip.zone);
+    } else {
+        gMacip.ipaddr_registered = 1;
+    }
+
     if (get_zones()) {
         return -1;
     }
@@ -828,5 +853,25 @@ macip_open(char *zone, uint32_t net, uint32_t mask, uint32_t ns,
 void macip_close(void)
 {
     nbp_unrgstr(gMacip.name, gMacip.type, gMacip.zone, NULL);
+
+    if (gMacip.ipaddr_registered) {
+        nbp_unrgstr(gMacip.name, MACIP_NODETYPE, gMacip.zone, NULL);
+    }
     close(gMacip.sock);
+}
+
+
+void macip_set_hooks(const struct macip_hooks *h)
+{
+    gHooks = *h;
+}
+
+/*!
+ * send an NBP lookup for obj:type in every zone we know
+ */
+void macip_nbp_lookup(char *obj, char *type)
+{
+    for (int i = 0; i < gZones.n; i++) {
+        nbp_lookup_req(gMacip.sock, obj, type, gZones.z[i]);
+    }
 }
