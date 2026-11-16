@@ -921,11 +921,16 @@ static void dhcp_send(struct lan_client *c, int type, uint32_t ciaddr,
     }
 
     if (type != 7) {
-        *o++ = 55;                          /* parameters wanted */
-        *o++ = 3;
-        *o++ = 1;
-        *o++ = 3;
-        *o++ = 6;
+        /* Ask for the same parameters, in the same order, as the Mac OS 9
+           (Open Transport) DHCP client, so DHCP fingerprinting (UniFi,
+           Fingerbank) recognises the client as a Mac. */
+        static const uint8_t prl[] = {
+            1, 3, 6, 15, 33, 42, 44, 45, 46, 47, 69, 70, 71, 74, 78, 79
+        };
+        *o++ = 55;
+        *o++ = sizeof(prl);
+        memcpy(o, prl, sizeof(prl));
+        o += sizeof(prl);
     }
 
     *o++ = 255;
