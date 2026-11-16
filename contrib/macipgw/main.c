@@ -486,12 +486,12 @@ int main(int argc, char *argv[])
     }
 
     if (pwd) {
-        if (setgid(user) == -1) {
+        if (setgid(group) == -1) {
             printf("macipgw: could not drop root privileges (group)\n");
             die(EX_OSERR);
         }
 
-        if (setuid(group) == -1) {
+        if (setuid(user) == -1) {
             printf("macipgw: could not drop root privileges (user)\n");
             die(EX_OSERR);
         }
