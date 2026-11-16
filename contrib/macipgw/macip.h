@@ -38,8 +38,24 @@ struct macip_hooks {
     void (*client_seen)(uint32_t ip, const struct sockaddr_at *sat);
     void (*client_gone)(uint32_t ip);
     void (*nbp_entry)(const struct nbpnve *nve);
+    void (*aep_reply)(const struct sockaddr_at *sat, const char *data,
+                      int len);
+    /* MacIP server address request: 1 = *ip/*mask set, 0 = not ready yet
+       (no reply; the client retries), -1 = lease from the pool */
+    int (*assign)(const struct sockaddr_at *sat, uint32_t *ip,
+                  uint32_t *mask);
+    /* track a client address outside the pool? */
+    int (*accept_ip)(uint32_t ip);
 };
 
 extern void macip_set_hooks(const struct macip_hooks *h);
 extern void macip_nbp_lookup(char *obj, char *type);
+extern uint32_t macip_presence_lease(void);
+extern void macip_presence_release(uint32_t ip);
+extern void macip_release_lease(uint32_t ip);
+extern int macip_send_ddp(const struct sockaddr_at *to, const char *buf,
+                          int len);
+extern int macip_local_addr(struct sockaddr_at *sat);
+extern int macip_pool_contains(uint32_t ip);
+extern void macip_assign_ready(const struct sockaddr_at *node);
 

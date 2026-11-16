@@ -40,6 +40,7 @@
 struct lan_override {
     char key[LAN_KEY_LEN];   /* identity key, IP address or "node N.N" */
     uint8_t mac[6];
+    char hostname[33];       /* optional DHCP hostname */
 };
 
 struct lan_config {
@@ -48,6 +49,10 @@ struct lan_config {
     uint32_t router;                /* 0 = take the host's default route */
     int announce_interval;          /* seconds between gratuitous ARPs */
     int identify_timeout;           /* seconds to wait for NBP names */
+    int presence;                   /* give AppleTalk-only Macs a presence */
+    int check_interval;             /* seconds between echo checks and scans */
+    int dhcp;                       /* lease addresses from the LAN's DHCP */
+    uint32_t client_mask;           /* netmask given to MacIP server clients */
     int noverrides;
     struct lan_override overrides[LAN_MAX_OVERRIDES];
 };
@@ -65,6 +70,11 @@ extern void lan_idle(void);
 extern void lan_client_seen(uint32_t ip, const struct sockaddr_at *sat);
 extern void lan_client_gone(uint32_t ip);
 extern void lan_nbp_entry(const struct nbpnve *nve);
+extern int  lan_assign(const struct sockaddr_at *sat, uint32_t *ip,
+                       uint32_t *mask);
+extern int  lan_accept_ip(uint32_t ip);
+extern void lan_aep_reply(const struct sockaddr_at *sat, const char *data,
+                          int len);
 
 
 #endif /* MACIPGW_LAN_H */

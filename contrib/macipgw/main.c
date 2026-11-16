@@ -252,9 +252,18 @@ static void read_clients(INIPARSER_DICTIONARY *config)
         struct lan_override *o = &gLanCfg.overrides[gLanCfg.noverrides];
         const char *k = keys[i] + strlen("clients:");
 
+        const char *comma = strchr(val, ',');
+
         if (lan_parse_mac(val, o->mac) < 0) {
             fprintf(stderr, "macipgw: [clients] %s: bad MAC '%s'\n", k, val);
             continue;
+        }
+
+        o->hostname[0] = 0;
+
+        if (comma) {            /* "MAC, hostname" */
+            snprintf(o->hostname, sizeof(o->hostname), "%s", comma + 1);
+            lan_tidy(o->hostname);
         }
 
         snprintf(o->key, sizeof(o->key), "%s", k);
@@ -289,6 +298,13 @@ macip_options *read_options(const char *conf)
                                  INISEC_GLOBAL ":announce interval", 60);
     options->identify_timeout = iniparser_getint(config,
                                 INISEC_GLOBAL ":identify timeout", 3);
+    options->presence = iniparser_getboolean(config,
+                        INISEC_GLOBAL ":appletalk presence", 0);
+    options->check_interval = iniparser_getint(config,
+                              INISEC_GLOBAL ":check interval", 30);
+    options->dhcp = iniparser_getboolean(config, INISEC_GLOBAL ":dhcp", 0);
+    options->client_netmask = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL,
+                              "client netmask", "255.255.255.255");
     read_clients(config);
     iniparser_freedict(config);
     return options;
@@ -405,6 +421,10 @@ int main(int argc, char *argv[])
             snprintf(gLanCfg.bridge, sizeof(gLanCfg.bridge), "%s", mio->bridge);
             gLanCfg.announce_interval = mio->announce_interval;
             gLanCfg.identify_timeout = mio->identify_timeout;
+            gLanCfg.presence = mio->presence;
+            gLanCfg.check_interval = mio->check_interval;
+            gLanCfg.dhcp = mio->dhcp;
+            gLanCfg.client_mask = atoip(mio->client_netmask);
             gLanCfg.router = mio->router[0] ? atoip(mio->router) : 0;
             uint8_t m[6];
             char pfx[32];
@@ -465,6 +485,9 @@ int main(int argc, char *argv[])
             .client_seen = lan_client_seen,
             .client_gone = lan_client_gone,
             .nbp_entry = lan_nbp_entry,
+            .aep_reply = lan_aep_reply,
+            .assign = lan_assign,
+            .accept_ip = lan_accept_ip,
         };
         macip_set_hooks(&hooks);
         tundev = lan_open(&gLanCfg, net + 1, macip_output);
@@ -522,6 +545,7 @@ int main(int argc, char *argv[])
         CONFIG_ARG_FREE(mio->bridge)
         CONFIG_ARG_FREE(mio->mac_prefix)
         CONFIG_ARG_FREE(mio->router)
+        CONFIG_ARG_FREE(mio->client_netmask)
     }
 
     server();

@@ -59,6 +59,9 @@
 #include "util.h"
 
 #define DDPTYPE_MACIP (22)
+#ifndef DDPTYPE_AEP
+#define DDPTYPE_AEP   (4)
+#endif
 #define MACIP_ASSIGN (1)
 #define MACIP_SERVER (3)
 #define MACIP_ERROR (-1)
@@ -82,6 +85,7 @@
 #define ASSIGN_FREE   (0)
 #define ASSIGN_LEASED (1)
 #define ASSIGN_FIXED  (2)
+#define ASSIGN_PRESENCE (3)     /* held for an AppleTalk-only Mac (LAN mode) */
 
 struct macip_req_control {
     uint16_t mipr_version;
@@ -111,7 +115,10 @@ struct ipent {
     long timo;
     int retr;
     struct sockaddr_at sat;
+    uint32_t ip;                /* address of an entry outside the pool */
 };
+
+#define MAX_DYN_IPENT 64        /* LAN mode: clients with addresses on the LAN */
 
 struct macip_data {
     uint32_t net;
@@ -121,6 +128,7 @@ struct macip_data {
     uint32_t addr;
     int nipent;
     struct ipent *ipent;
+    struct ipent dyn[MAX_DYN_IPENT];
 
     int sock;
     ATP atp;
@@ -131,7 +139,9 @@ struct macip_data {
     int ipaddr_registered;
 };
 
-#define IPADDR(e) (e - gMacip.ipent + gMacip.net + 1)
+#define IN_POOL(e) ((e) >= gMacip.ipent && (e) < gMacip.ipent + gMacip.nipent)
+#define IPADDR(e) (IN_POOL(e) ? (uint32_t)((e) - gMacip.ipent + gMacip.net + 1) \
+                   : (e)->ip)
 
 #define MAXZONES 256
 
@@ -142,6 +152,18 @@ struct zones {
 
 static struct macip_data gMacip;
 static struct macip_hooks gHooks;
+
+/* LAN mode: address requests waiting for a DHCP lease, answered later */
+#define MAX_PENDING_ASSIGN 16
+#define PENDING_ASSIGN_TTL 30
+
+static struct pending_assign {
+    int used;
+    struct sockaddr_at sat;     /* requester, including its ATP socket */
+    uint16_t tid;
+    uint8_t xo;
+    long expires;
+} gPending[MAX_PENDING_ASSIGN];
 static struct zones gZones;
 static outputfunc_t gOutput;
 
@@ -206,8 +228,34 @@ static long now(void)
 
 struct ipent *get_ipent(uint32_t ip)
 {
-    return (ip - gMacip.net > 0 && ip - gMacip.net < gMacip.nipent) ?
-           &gMacip.ipent[ip - gMacip.net - 1] : 0;
+    if (ip - gMacip.net > 0 && ip - gMacip.net < (uint32_t) gMacip.nipent) {
+        return &gMacip.ipent[ip - gMacip.net - 1];
+    }
+
+    for (int i = 0; i < MAX_DYN_IPENT; i++)
+        if (gMacip.dyn[i].assigned != ASSIGN_FREE && gMacip.dyn[i].ip == ip) {
+            return &gMacip.dyn[i];
+        }
+
+    return 0;
+}
+
+/*!
+ * LAN mode: an entry for a client address outside the pool
+ */
+static struct ipent *dyn_alloc(uint32_t ip)
+{
+    for (int i = 0; i < MAX_DYN_IPENT; i++) {
+        struct ipent *e = &gMacip.dyn[i];
+
+        if (e->assigned == ASSIGN_FREE) {
+            bzero(e, sizeof(*e));
+            e->ip = ip;
+            return e;
+        }
+    }
+
+    return 0;
 }
 
 /*!
@@ -271,6 +319,10 @@ static void arp_set(uint32_t ip, struct sockaddr_at *sat)
 {
     struct ipent *e;
     e = get_ipent(ip);
+
+    if (!e && gHooks.accept_ip && gHooks.accept_ip(ip)) {
+        e = dyn_alloc(ip);
+    }
 
     if (e) {
         bcopy(sat, &e->sat, sizeof(struct sockaddr_at));
@@ -394,6 +446,128 @@ void macip_output(char *buffer, int len)
  * handle configuration ATP request
  */
 
+/*!
+ * answer (or, in LAN mode, hold) a MacIP server address request
+ */
+static void assign_reply(struct sockaddr_at *sat, uint16_t tid, uint8_t xo)
+{
+    struct atp_block atpb;
+    struct iovec iov;
+    char buffer[600];
+    struct macip_req *rq = (struct macip_req *) buffer;
+    int len = sizeof(struct macip_req) - 21;
+    uint32_t ip = 0, mask = gMacip.mask;
+    int r = -1;
+
+    if (gHooks.assign) {
+        r = gHooks.assign(sat, &ip, &mask);
+    }
+
+    if (r == 0) {
+        /* waiting for a DHCP lease: remember the request */
+        struct pending_assign *p = NULL;
+
+        for (int i = 0; i < MAX_PENDING_ASSIGN; i++) {
+            struct pending_assign *x = &gPending[i];
+
+            if (x->used && x->sat.sat_addr.s_net == sat->sat_addr.s_net &&
+                    x->sat.sat_addr.s_node == sat->sat_addr.s_node) {
+                p = x;          /* a retry: answer the latest one */
+                break;
+            }
+
+            if (!x->used && !p) {
+                p = x;
+            }
+        }
+
+        if (p) {
+            p->used = 1;
+            p->sat = *sat;
+            p->tid = tid;
+            p->xo = xo;
+            p->expires = now() + PENDING_ASSIGN_TTL;
+        }
+
+        if (gDebug & DEBUG_MACIP) {
+            printf("assign request from %d.%d held\n",
+                   ntohs(sat->sat_addr.s_net), sat->sat_addr.s_node);
+        }
+
+        return;
+    }
+
+    bzero(rq, sizeof(struct macip_req));
+    rq->miprc.mipr_version = htons(1U);
+    rq->miprc.mipr_function = htonl(MACIP_ASSIGN);
+    rq->miprd.mipr_nameserver = htonl(gMacip.nameserver);
+
+    if (r < 0) {
+        ip = lease_ip();
+        mask = gMacip.mask;
+    }
+
+    if (ip) {
+        rq->miprd.mipr_ipaddr = htonl(ip);
+        rq->miprd.mipr_subnet = htonl(mask);
+        rq->miprd.mipr_broadcast = htonl(r > 0 ? (ip | ~mask) :
+                                         gMacip.broadcast);
+        arp_set(ip, sat);
+
+        if (gDebug & DEBUG_MACIP) {
+            printf("assigned %s%s.\n", iptoa(ip), r > 0 ? " (LAN)" : "");
+        }
+    } else {
+        rq->miprc.mipr_function = htonl(MACIP_ERROR);
+        rq->miprd.mipr_subnet = htonl(gMacip.mask);
+        rq->miprd.mipr_broadcast = htonl(gMacip.broadcast);
+        memcpy(rq->miprd.mipr_error, error_noip, sizeof(error_noip));
+        len += (int)(sizeof(error_noip) - 1);
+    }
+
+    gMacip.atp->atph_rtid = tid;
+    gMacip.atp->atph_rxo = xo;
+    bzero(&atpb, sizeof(atpb));
+    atpb.atp_saddr = sat;
+    iov.iov_base = buffer;
+    iov.iov_len = len;
+    atpb.atp_sresiov = &iov;
+    atpb.atp_sresiovcnt = 1;
+
+    if (atp_sresp(gMacip.atp, &atpb) < 0 && gDebug & DEBUG_MACIP) {
+        perror("macip: assign_reply: atp_sresp");
+    }
+}
+
+/*!
+ * LAN mode: the address for the client at this AppleTalk node is ready (or
+ * will never be); answer its held request
+ */
+void macip_assign_ready(const struct sockaddr_at *node)
+{
+    long n = now();
+
+    for (int i = 0; i < MAX_PENDING_ASSIGN; i++) {
+        struct pending_assign *p = &gPending[i];
+
+        if (!p->used) {
+            continue;
+        }
+
+        if (p->expires < n) {
+            p->used = 0;
+            continue;
+        }
+
+        if (p->sat.sat_addr.s_net == node->sat_addr.s_net &&
+                p->sat.sat_addr.s_node == node->sat_addr.s_node) {
+            struct sockaddr_at sat = p->sat;
+            p->used = 0;
+            assign_reply(&sat, p->tid, p->xo);
+        }
+    }
+}
+
 static void config_input(ATP atp, struct sockaddr_at *faddr, char *packet,
                          int len)
 {
@@ -403,7 +577,6 @@ static void config_input(ATP atp, struct sockaddr_at *faddr, char *packet,
     char buffer[600];
     struct macip_req *rq;
     int f;
-    uint32_t ip;
 
     if (atp_input(atp, faddr, packet, len) < 0) {
         if (gDebug & DEBUG_MACIP) {
@@ -457,22 +630,8 @@ static void config_input(ATP atp, struct sockaddr_at *faddr, char *packet,
 
     switch (f) {
     case MACIP_ASSIGN:
-        rq->miprc.mipr_function = htonl(MACIP_ASSIGN);
-
-        if ((ip = lease_ip())) {
-            rq->miprd.mipr_ipaddr = htonl(ip);
-            arp_set(ip, &sat);
-
-            if (gDebug & DEBUG_MACIP) {
-                printf("assigned %s.\n", iptoa(ip));
-            }
-        } else {
-            rq->miprc.mipr_function = htonl(MACIP_ERROR);
-            memcpy(rq->miprd.mipr_error, error_noip, sizeof(error_noip));
-            len += (int)(sizeof(error_noip) - 1);
-        }
-
-        break;
+        assign_reply(&sat, gMacip.atp->atph_rtid, gMacip.atp->atph_rxo);
+        return;
 
     case MACIP_SERVER:
         rq->miprc.mipr_function = htonl(MACIP_SERVER);
@@ -537,6 +696,13 @@ void macip_input(void)
 
         case DDPTYPE_MACIP:
             ip_input(&sat, buffer + 1, len - 1);
+            break;
+
+        case DDPTYPE_AEP:
+            if (gHooks.aep_reply && len > 1) {
+                gHooks.aep_reply(&sat, buffer + 1, len - 1);
+            }
+
             break;
         }
     } else {
@@ -730,10 +896,12 @@ out:
 void macip_idle(void)
 {
     struct ipent *e;
-    int i;
     long n = now();
 
-    for (i = gMacip.nipent, e = gMacip.ipent; i--; e++) {
+    for (int i = 0; i < gMacip.nipent + MAX_DYN_IPENT; i++) {
+        e = i < gMacip.nipent ? &gMacip.ipent[i] :
+            &gMacip.dyn[i - gMacip.nipent];
+
         if ((e->assigned == ASSIGN_LEASED) && (e->timo < n)) {
             if (e->retr--) {
                 icmp_echo(gMacip.addr, IPADDR(e));
@@ -873,5 +1041,68 @@ void macip_nbp_lookup(char *obj, char *type)
 {
     for (int i = 0; i < gZones.n; i++) {
         nbp_lookup_req(gMacip.sock, obj, type, gZones.z[i]);
+    }
+}
+
+/*!
+ * hold a free pool address for an AppleTalk-only Mac; 0 if none left
+ */
+uint32_t macip_presence_lease(void)
+{
+    for (int i = 0; i < gMacip.nipent; i++) {
+        if (gMacip.ipent[i].assigned == ASSIGN_FREE) {
+            gMacip.ipent[i].assigned = ASSIGN_PRESENCE;
+            bzero(&gMacip.ipent[i].sat, sizeof(struct sockaddr_at));
+            return gMacip.net + i + 1;
+        }
+    }
+
+    return 0;
+}
+
+void macip_presence_release(uint32_t ip)
+{
+    struct ipent *e = get_ipent(ip);
+
+    if (e && e->assigned == ASSIGN_PRESENCE) {
+        e->assigned = ASSIGN_FREE;
+    }
+}
+
+/*!
+ * send a raw DDP packet (first byte is the DDP type) from the gateway socket
+ */
+int macip_send_ddp(const struct sockaddr_at *to, const char *buf, int len)
+{
+    return sendto(gMacip.sock, buf, len, 0, (const struct sockaddr *) to,
+                  sizeof(*to));
+}
+
+/*!
+ * the gateway's own AppleTalk address
+ */
+int macip_local_addr(struct sockaddr_at *sat)
+{
+    socklen_t len = sizeof(*sat);
+    return getsockname(gMacip.sock, (struct sockaddr *) sat, &len);
+}
+
+/*!
+ * is ip one of the gateway's own pool addresses?
+ */
+int macip_pool_contains(uint32_t ip)
+{
+    return ip - gMacip.net > 0 && ip - gMacip.net < (uint32_t) gMacip.nipent;
+}
+
+/*!
+ * free a MacIP lease (LAN mode found the Mac gone)
+ */
+void macip_release_lease(uint32_t ip)
+{
+    struct ipent *e = get_ipent(ip);
+
+    if (e && e->assigned == ASSIGN_LEASED) {
+        e->assigned = ASSIGN_FREE;
     }
 }

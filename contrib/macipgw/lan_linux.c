@@ -67,6 +67,23 @@
 #define MACIP_MTU       586
 #define LAN_MAX_CLIENTS 64
 #define LAN_HOLD        4       /* packets held per client while identifying */
+#define LAN_MAX_NODES   128
+#define DDPTYPE_AEP_    4
+#define AEP_SOCKET      4
+#define AEP_REQUEST     1
+#define AEP_REPLY       2
+#define PRESENCE_MISSES 3       /* unanswered echo rounds before "gone" */
+#define SCAN_SETTLE     2       /* seconds to collect lookup replies */
+#define DHCP_SPORT      67
+#define DHCP_CPORT      68
+#define DHCP_RETRY      2       /* seconds between DHCP retransmissions */
+#define DHCP_TRIES      4       /* before falling back to the pool */
+
+#define D_NONE       0
+#define D_SELECTING  1          /* DISCOVER sent */
+#define D_REQUESTING 2          /* REQUEST sent */
+#define D_BOUND      3
+#define D_FAILED     4          /* no usable answer: pool or keep address */
 #define LAN_MAX_ARP     128
 #define ARP_TTL         300     /* seconds a learned LAN mapping is kept */
 #define ARP_RETRY       1       /* seconds between ARP requests */
@@ -95,6 +112,36 @@ struct lan_client {
     char held[LAN_HOLD][MACIP_MTU];
     int held_len[LAN_HOLD];
     int nheld;
+    /* AppleTalk-only presence */
+    int presence;
+    long last_reply;
+    uint16_t aep_seq;
+    uint16_t ping_seq;          /* AEP sequence that will answer the ping */
+    char ping[1500];            /* LAN echo request waiting for that AEP */
+    int ping_len;
+    /* DHCP lease held on the client's behalf */
+    int dhcp;                   /* D_* */
+    int manual;                 /* the Mac chose its own address */
+    uint32_t xid;
+    int tries;
+    long dhcp_next;
+    uint32_t offered, server_ip;
+    uint8_t server_mac[6];
+    long renew_at, expire_at;
+    char hostname[33];
+};
+
+/* a node seen in an NBP scan, for AppleTalk-only presence */
+struct at_node {
+    int used;
+    uint16_t net;               /* network byte order, as in sat_addr */
+    uint8_t node;
+    long seen;
+    char ws_name[NBPSTRLEN + 1];
+    char cand_obj[NBPSTRLEN + 1];
+    char cand_type[NBPSTRLEN + 1];
+    int cand_sock;
+    int cand_score;
 };
 
 struct arp_entry {
@@ -124,6 +171,10 @@ static struct {
     struct lan_client clients[LAN_MAX_CLIENTS];
     struct arp_entry arp[LAN_MAX_ARP];
     long last_lookup;
+    struct at_node nodes[LAN_MAX_NODES];
+    long next_scan;             /* next presence scan */
+    long scan_time;             /* when the current scan was sent */
+    int scan_pending;
 } gLan;
 
 static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -235,6 +286,8 @@ static void send_arp(uint16_t op, const uint8_t eth_dst[6],
 }
 
 static void route_out(struct lan_client *c, char *buffer, int len);
+static void dhcp_start(struct lan_client *c);
+static void dhcp_release(struct lan_client *c);
 
 static void announce(struct lan_client *c)
 {
@@ -251,7 +304,8 @@ static void announce(struct lan_client *c)
 static struct lan_client *client_by_ip(uint32_t ip)
 {
     for (int i = 0; i < LAN_MAX_CLIENTS; i++)
-        if (gLan.clients[i].state != CL_FREE && gLan.clients[i].ip == ip) {
+        if (gLan.clients[i].state != CL_FREE && gLan.clients[i].ip == ip &&
+                ip != 0) {
             return &gLan.clients[i];
         }
 
@@ -335,6 +389,7 @@ static void activate(struct lan_client *c)
     if (o) {
         memcpy(c->mac, o->mac, 6);
         c->mac_fixed = 1;
+        snprintf(c->hostname, sizeof(c->hostname), "%s", o->hostname);
     } else {
         lan_derive_mac(c->key, gLan.cfg.prefix, c->mac);
         c->mac_fixed = 0;
@@ -347,15 +402,21 @@ static void activate(struct lan_client *c)
     }
 
     c->state = CL_ACTIVE;
-    syslog(LOG_INFO, "client %s (%u.%u) is '%s', MAC %s%s", iptoa(c->ip),
+    c->last_reply = lan_now();
+    syslog(LOG_INFO, "client %s (%u.%u) is '%s', MAC %s%s%s", iptoa(c->ip),
            ntohs(c->sat.sat_addr.s_net), c->sat.sat_addr.s_node, c->key,
-           mactoa(c->mac), c->mac_fixed ? " (configured)" : "");
+           mactoa(c->mac), c->mac_fixed ? " (configured)" : "",
+           c->presence ? ", AppleTalk only" : "");
 
     if (gDebug & DEBUG_LAN)
         printf("lan: client %s is '%s' -> %s\n", iptoa(c->ip), c->key,
                mactoa(c->mac));
 
-    announce(c);
+    dhcp_start(c);
+
+    if (c->ip) {
+        announce(c);
+    }
 
     for (int i = 0; i < c->nheld; i++) {
         route_out(c, c->held[i], c->held_len[i]);
@@ -364,13 +425,35 @@ static void activate(struct lan_client *c)
     c->nheld = 0;
 }
 
+static void presence_drop(struct lan_client *c, const char *why)
+{
+    syslog(LOG_INFO, "client %s ('%s') %s", iptoa(c->ip), c->key, why);
+    dhcp_release(c);
+    macip_presence_release(c->ip);
+    c->state = CL_FREE;
+}
+
 void lan_client_seen(uint32_t ip, const struct sockaddr_at *sat)
 {
-    struct lan_client *c = client_by_ip(ip);
+    struct lan_client *c;
 
     if (ip == gLan.gwaddr) {
         return;
     }
+
+    /* an AppleTalk-only Mac that has started using MacIP: drop its presence
+       entry; it is identified again and keeps the same MAC */
+    for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
+        struct lan_client *p = &gLan.clients[i];
+
+        if (p->state != CL_FREE && p->presence && p->ip != ip &&
+                p->sat.sat_addr.s_net == sat->sat_addr.s_net &&
+                p->sat.sat_addr.s_node == sat->sat_addr.s_node) {
+            presence_drop(p, "now uses MacIP");
+        }
+    }
+
+    c = client_by_ip(ip);
 
     if (c) {
         if (c->sat.sat_addr.s_net == sat->sat_addr.s_net &&
@@ -408,8 +491,75 @@ void lan_client_gone(uint32_t ip)
 
     if (c) {
         syslog(LOG_INFO, "client %s ('%s') gone", iptoa(ip), c->key);
+        dhcp_release(c);
         c->state = CL_FREE;
     }
+}
+
+/* fold one NBP name into a node's identity candidates */
+static void note_name(char *ws_name, char *cand_obj, char *cand_type,
+                      int *cand_sock, int *cand_score, const char *obj,
+                      const char *type, int sock)
+{
+    if (strcasecmp(type, "Workstation") == 0) {
+        snprintf(ws_name, NBPSTRLEN + 1, "%s", obj);
+        return;
+    }
+
+    /* prefer a model-like type (the Responder's name:model entry), then the
+       highest socket */
+    int score = lan_model_score(type);
+
+    if (score == 0 || score < *cand_score ||
+            (score == *cand_score && sock <= *cand_sock)) {
+        return;
+    }
+
+    *cand_score = score;
+    *cand_sock = sock;
+    snprintf(cand_obj, NBPSTRLEN + 1, "%s", obj);
+    snprintf(cand_type, NBPSTRLEN + 1, "%s", type);
+}
+
+static void scan_note(const struct nbpnve *nve, const char *obj,
+                      const char *type)
+{
+    struct at_node *n = NULL, *free_slot = NULL;
+
+    for (int i = 0; i < LAN_MAX_NODES; i++) {
+        struct at_node *x = &gLan.nodes[i];
+
+        if (x->used && x->net == nve->nn_sat.sat_addr.s_net &&
+                x->node == nve->nn_sat.sat_addr.s_node) {
+            n = x;
+            break;
+        }
+
+        if (!x->used && !free_slot) {
+            free_slot = x;
+        }
+    }
+
+    if (!n) {
+        if (!free_slot) {
+            return;
+        }
+
+        n = free_slot;
+        memset(n, 0, sizeof(*n));
+        n->used = 1;
+        n->net = nve->nn_sat.sat_addr.s_net;
+        n->node = nve->nn_sat.sat_addr.s_node;
+    }
+
+    if (n->seen < gLan.scan_time) {     /* first answer in this scan */
+        n->ws_name[0] = n->cand_obj[0] = n->cand_type[0] = 0;
+        n->cand_sock = n->cand_score = 0;
+    }
+
+    n->seen = lan_now();
+    note_name(n->ws_name, n->cand_obj, n->cand_type, &n->cand_sock,
+              &n->cand_score, obj, type, nve->nn_sat.sat_port);
 }
 
 void lan_nbp_entry(const struct nbpnve *nve)
@@ -424,6 +574,10 @@ void lan_nbp_entry(const struct nbpnve *nve)
     if (strcasecmp(type, "IPADDRESS") == 0 ||
             strcasecmp(type, "IPGATEWAY") == 0) {
         return;
+    }
+
+    if (gLan.cfg.presence && gLan.scan_pending) {
+        scan_note(nve, obj, type);
     }
 
     for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
@@ -441,29 +595,635 @@ void lan_nbp_entry(const struct nbpnve *nve)
             c->deadline = lan_now() + 1;
         }
 
-        if (strcasecmp(type, "Workstation") == 0) {
-            snprintf(c->ws_name, sizeof(c->ws_name), "%s", obj);
-        } else {
-            /* prefer a model-like type (the Responder's name:model entry),
-               then the highest socket */
-            int score = lan_model_score(type);
-
-            if (score == 0 || score < c->cand_score ||
-                    (score == c->cand_score &&
-                     nve->nn_sat.sat_port <= c->cand_sock)) {
-                continue;
-            }
-
-            c->cand_score = score;
-            c->cand_sock = nve->nn_sat.sat_port;
-            snprintf(c->cand_obj, sizeof(c->cand_obj), "%s", obj);
-            snprintf(c->cand_type, sizeof(c->cand_type), "%s", type);
-        }
+        note_name(c->ws_name, c->cand_obj, c->cand_type, &c->cand_sock,
+                  &c->cand_score, obj, type, nve->nn_sat.sat_port);
 
         if (gDebug & DEBUG_LAN)
             printf("lan: %s candidate '%s:%s' socket %u\n", iptoa(c->ip), obj,
                    type, nve->nn_sat.sat_port);
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* AppleTalk-only presence                                             */
+/* ------------------------------------------------------------------ */
+
+/* AppleTalk Echo to the client's node; the payload identifies the client */
+static void aep_send(struct lan_client *c, uint16_t seq)
+{
+    struct sockaddr_at to = c->sat;
+    char b[8];
+    int idx = (int)(c - gLan.clients);
+
+    to.sat_port = AEP_SOCKET;
+    to.sat_family = AF_APPLETALK;
+    b[0] = DDPTYPE_AEP_;
+    b[1] = AEP_REQUEST;
+    b[2] = 'M';
+    b[3] = 'N';
+    b[4] = (char) idx;
+    b[5] = (char)(seq >> 8);
+    b[6] = (char)(seq & 0xff);
+    b[7] = 0;
+
+    if (macip_send_ddp(&to, b, sizeof(b)) < 0 && (gDebug & DEBUG_LAN)) {
+        perror("lan: AEP send");
+    }
+}
+
+void lan_aep_reply(const struct sockaddr_at *sat, const char *data, int len)
+{
+    const uint8_t *d = (const uint8_t *) data;
+    struct lan_client *c;
+    uint16_t seq;
+
+    if (len < 6 || d[0] != AEP_REPLY || d[1] != 'M' || d[2] != 'N' ||
+            d[3] >= LAN_MAX_CLIENTS) {
+        return;
+    }
+
+    c = &gLan.clients[d[3]];
+    seq = (uint16_t)(d[4] << 8 | d[5]);
+
+    if (c->state != CL_ACTIVE ||
+            c->sat.sat_addr.s_net != sat->sat_addr.s_net ||
+            c->sat.sat_addr.s_node != sat->sat_addr.s_node) {
+        return;
+    }
+
+    c->last_reply = lan_now();
+
+    if (c->presence && c->ping_len && seq == c->ping_seq) {
+        /* the Mac is there: answer the LAN ping on its behalf */
+        uint8_t *p = (uint8_t *) c->ping;
+        int hl = (p[0] & 0x0f) * 4, tot = c->ping_len;
+        uint8_t t[4];
+        uint16_t sum;
+
+        memcpy(t, p + 12, 4);
+        memcpy(p + 12, p + 16, 4);
+        memcpy(p + 16, t, 4);
+        p[8] = 64;
+        p[10] = p[11] = 0;
+        sum = ip_cksum(p, hl);
+        memcpy(p + 10, &sum, 2);
+        p[hl] = 0;              /* echo reply */
+        p[hl + 2] = p[hl + 3] = 0;
+        sum = ip_cksum(p + hl, tot - hl);
+        memcpy(p + hl + 2, &sum, 2);
+        c->ping_len = 0;
+        route_out(c, c->ping, tot);
+    }
+}
+
+/* a LAN echo request for an AppleTalk-only Mac: ask the Mac first */
+static void presence_ping(struct lan_client *c, const uint8_t *ip, int len)
+{
+    int hl = (ip[0] & 0x0f) * 4, tot = ip[2] << 8 | ip[3];
+
+    if (ip[9] != 1 || tot < hl + 8 || tot > len || ip[hl] != 8 ||
+            tot > (int) sizeof(c->ping) || (ip[6] & 0x3f) || ip[7]) {
+        return;                 /* only whole ICMP echo requests */
+    }
+
+    memcpy(c->ping, ip, tot);
+    c->ping_len = tot;
+    c->ping_seq = ++c->aep_seq;
+    aep_send(c, c->ping_seq);
+}
+
+static int node_has_macip_client(uint16_t net, uint8_t node)
+{
+    for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
+        const struct lan_client *c = &gLan.clients[i];
+
+        if (c->state != CL_FREE && !c->presence &&
+                c->sat.sat_addr.s_net == net && c->sat.sat_addr.s_node == node) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/* after a scan: give every Mac that is only on AppleTalk a presence */
+static void presence_evaluate(void)
+{
+    struct sockaddr_at me;
+    char key[LAN_KEY_LEN];
+    long n = lan_now();
+
+    memset(&me, 0, sizeof(me));
+    macip_local_addr(&me);
+
+    for (int i = 0; i < LAN_MAX_NODES; i++) {
+        struct at_node *a = &gLan.nodes[i];
+        struct lan_client *c = NULL;
+
+        if (!a->used || a->seen < gLan.scan_time) {
+            continue;
+        }
+
+        if ((a->net == me.sat_addr.s_net && a->node == me.sat_addr.s_node) ||
+                node_has_macip_client(a->net, a->node)) {
+            continue;           /* the gateway itself, or already on MacIP */
+        }
+
+        if (!a->ws_name[0] && a->cand_score < 2) {
+            continue;           /* not recognisably a Mac (a printer, say) */
+        }
+
+        if (lan_identity_key(a->ws_name, a->cand_obj, a->cand_type, key,
+                             sizeof(key)) < 0) {
+            continue;
+        }
+
+        for (int j = 0; j < LAN_MAX_CLIENTS && !c; j++) {
+            struct lan_client *x = &gLan.clients[j];
+
+            if (x->state == CL_ACTIVE && x->presence &&
+                    strcasecmp(x->key, key) == 0) {
+                c = x;
+            }
+        }
+
+        if (c) {                /* known; its node may have changed */
+            c->sat.sat_addr.s_net = a->net;
+            c->sat.sat_addr.s_node = a->node;
+            continue;
+        }
+
+        for (int j = 0; j < LAN_MAX_CLIENTS && !c; j++)
+            if (gLan.clients[j].state == CL_FREE) {
+                c = &gLan.clients[j];
+            }
+
+        if (!c) {
+            syslog(LOG_ERR, "lan: client table full, '%s' ignored", key);
+            continue;
+        }
+
+        uint32_t ip = gLan.cfg.dhcp ? 0 : macip_presence_lease();
+
+        if (!ip && !gLan.cfg.dhcp) {
+            syslog(LOG_WARNING, "no free address for AppleTalk-only '%s'",
+                   key);
+            continue;
+        }
+
+        memset(c, 0, sizeof(*c));
+        c->presence = 1;
+        c->ip = ip;
+        c->sat.sat_family = AF_APPLETALK;
+        c->sat.sat_addr.s_net = a->net;
+        c->sat.sat_addr.s_node = a->node;
+        c->sat.sat_port = AEP_SOCKET;
+        c->last_reply = n;
+        snprintf(c->ws_name, sizeof(c->ws_name), "%s", a->ws_name);
+        snprintf(c->cand_obj, sizeof(c->cand_obj), "%s", a->cand_obj);
+        snprintf(c->cand_type, sizeof(c->cand_type), "%s", a->cand_type);
+        activate(c);
+    }
+}
+
+/*
+ * periodic: echo-check every client (a Mac that stops answering is gone,
+ * whether it used MacIP or only AppleTalk) and, with presence enabled, scan
+ * for AppleTalk-only Macs
+ */
+static void check_idle(void)
+{
+    long n = lan_now();
+    int interval = gLan.cfg.check_interval;
+
+    if (gLan.scan_pending && n >= gLan.scan_time + SCAN_SETTLE) {
+        gLan.scan_pending = 0;
+        presence_evaluate();
+    }
+
+    if (n < gLan.next_scan) {
+        return;
+    }
+
+    gLan.next_scan = n + interval;
+
+    if (gLan.cfg.presence) {
+        gLan.scan_time = n;
+        gLan.scan_pending = 1;
+        macip_nbp_lookup("=", "=");
+    }
+
+    for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
+        struct lan_client *c = &gLan.clients[i];
+
+        if (c->state != CL_ACTIVE) {
+            continue;
+        }
+
+        if (n - c->last_reply <= (long) interval * PRESENCE_MISSES) {
+            aep_send(c, ++c->aep_seq);
+        } else if (c->presence) {
+            presence_drop(c, "stopped answering, gone");
+        } else {
+            syslog(LOG_INFO, "client %s ('%s') stopped answering, gone",
+                   iptoa(c->ip), c->key);
+            macip_release_lease(c->ip);
+            c->state = CL_FREE;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* DHCP on behalf of clients                                           */
+/* ------------------------------------------------------------------ */
+
+static int in_pool(uint32_t ip)
+{
+    return macip_pool_contains(ip);
+}
+
+/* "G3 AIO:Power Macintosh" -> "G3-AIO" */
+static void make_hostname(const char *key, char *out, size_t len)
+{
+    size_t o = 0;
+    int dash = 1;
+
+    for (const char *p = key; *p && *p != ':' && o + 1 < len; p++) {
+        if (isalnum((unsigned char) *p)) {
+            out[o++] = *p;
+            dash = 0;
+        } else if (!dash) {
+            out[o++] = '-';
+            dash = 1;
+        }
+    }
+
+    while (o > 0 && out[o - 1] == '-') {
+        o--;
+    }
+
+    out[o] = 0;
+}
+
+/* build and broadcast (or unicast) a DHCP message from the client */
+static void dhcp_send(struct lan_client *c, int type, uint32_t ciaddr,
+                      uint32_t req_ip, uint32_t server)
+{
+    uint8_t pkt[20 + 8 + 300];
+    uint8_t *ip = pkt, *udp = pkt + 20, *b = pkt + 28, *o;
+    int unicast = (type == 7);              /* RELEASE goes to the server */
+    uint32_t dst = unicast ? c->server_ip : 0xffffffff;
+    uint16_t sum;
+
+    memset(pkt, 0, sizeof(pkt));
+    b[0] = 1;                               /* BOOTREQUEST */
+    b[1] = 1;                               /* Ethernet */
+    b[2] = 6;
+    put32(b + 4, c->xid);
+
+    if (!ciaddr) {
+        b[10] = 0x80;                       /* ask for a broadcast reply */
+    }
+
+    put32(b + 12, ciaddr);
+    memcpy(b + 28, c->mac, 6);
+    put32(b + 236, 0x63825363);             /* magic cookie */
+    o = b + 240;
+    *o++ = 53;
+    *o++ = 1;
+    *o++ = (uint8_t) type;
+    *o++ = 61;                              /* client identifier */
+    *o++ = 7;
+    *o++ = 1;
+    memcpy(o, c->mac, 6);
+    o += 6;
+
+    if (c->hostname[0] && type != 7) {
+        size_t n = strlen(c->hostname);
+        *o++ = 12;
+        *o++ = (uint8_t) n;
+        memcpy(o, c->hostname, n);
+        o += n;
+    }
+
+    if (req_ip) {
+        *o++ = 50;
+        *o++ = 4;
+        put32(o, req_ip);
+        o += 4;
+    }
+
+    if (server) {
+        *o++ = 54;
+        *o++ = 4;
+        put32(o, server);
+        o += 4;
+    }
+
+    if (type != 7) {
+        *o++ = 55;                          /* parameters wanted */
+        *o++ = 3;
+        *o++ = 1;
+        *o++ = 3;
+        *o++ = 6;
+    }
+
+    *o++ = 255;
+
+    /* UDP 68 -> 67, checksum left at zero (allowed for IPv4) */
+    udp[0] = 0;
+    udp[1] = DHCP_CPORT;
+    udp[2] = 0;
+    udp[3] = DHCP_SPORT;
+    udp[4] = (8 + 300) >> 8;
+    udp[5] = (8 + 300) & 0xff;
+
+    ip[0] = 0x45;
+    ip[2] = sizeof(pkt) >> 8;
+    ip[3] = sizeof(pkt) & 0xff;
+    ip[8] = 64;
+    ip[9] = 17;
+    put32(ip + 12, ciaddr);
+    put32(ip + 16, dst);
+    sum = ip_cksum(ip, 20);
+    memcpy(ip + 10, &sum, 2);
+
+    send_frame(unicast ? c->server_mac : bcast, c->mac, ETHTYPE_IP, pkt,
+               sizeof(pkt));
+    c->dhcp_next = lan_now() + DHCP_RETRY;
+}
+
+static void dhcp_discover(struct lan_client *c)
+{
+    c->dhcp = D_SELECTING;
+    dhcp_send(c, 1, 0, 0, 0);
+}
+
+static void dhcp_start(struct lan_client *c)
+{
+    if (!gLan.cfg.dhcp || c->dhcp != D_NONE) {
+        return;
+    }
+
+    if (!c->hostname[0]) {
+        make_hostname(c->key, c->hostname, sizeof(c->hostname));
+    }
+    c->xid = (uint32_t) random();
+    c->tries = 1;
+
+    if (c->ip && in_pool(c->ip)) {
+        c->dhcp = D_FAILED;                 /* a pool address: no DHCP */
+    } else if (c->ip) {
+        /* the Mac already uses an address: ask the server to confirm it */
+        c->manual = 1;
+        c->dhcp = D_REQUESTING;
+        dhcp_send(c, 3, 0, c->ip, 0);
+    } else {
+        dhcp_discover(c);
+    }
+}
+
+static void dhcp_release(struct lan_client *c)
+{
+    if (c->dhcp == D_BOUND && c->server_ip) {
+        dhcp_send(c, 7, c->ip, 0, c->server_ip);
+    }
+
+    c->dhcp = D_NONE;
+}
+
+static void dhcp_bound(struct lan_client *c, uint32_t yiaddr, uint32_t lease)
+{
+    long n = lan_now();
+    int first = (c->dhcp != D_BOUND);
+
+    if (lease == 0 || lease > 7 * 86400) {
+        lease = 86400;
+    }
+
+    c->dhcp = D_BOUND;
+    c->renew_at = n + lease / 2;
+    c->expire_at = n + lease;
+
+    if (!c->ip) {
+        c->ip = yiaddr;
+    }
+
+    if (first) {
+        syslog(LOG_INFO, "client '%s' leased %s from %s as '%s'", c->key,
+               iptoa(c->ip), c->manual ? "DHCP (its own address)" : "DHCP",
+               c->hostname);
+        announce(c);
+        macip_assign_ready(&c->sat);    /* answer a held address request */
+    }
+}
+
+/* a DHCP reply on the LAN; 1 if it was for one of our clients */
+static int dhcp_input(const uint8_t *frame, int len)
+{
+    const uint8_t *ip = frame + ETH_HLEN_, *b, *o, *end;
+    int hl, type = 0;
+    uint32_t xid, yiaddr, server = 0, lease = 0;
+    struct lan_client *c = NULL;
+
+    hl = (ip[0] & 0x0f) * 4;
+
+    if (ip[9] != 17 || len < ETH_HLEN_ + hl + 8 + 240 ||
+            (ip[hl + 2] << 8 | ip[hl + 3]) != DHCP_CPORT) {
+        return 0;
+    }
+
+    b = ip + hl + 8;
+    end = frame + len;
+
+    if (b[0] != 2 || get32(b + 236) != 0x63825363) {
+        return 0;
+    }
+
+    xid = get32(b + 4);
+    yiaddr = get32(b + 16);
+
+    for (int i = 0; i < LAN_MAX_CLIENTS && !c; i++) {
+        struct lan_client *x = &gLan.clients[i];
+
+        if (x->state == CL_ACTIVE && x->xid == xid &&
+                memcmp(x->mac, b + 28, 6) == 0) {
+            c = x;
+        }
+    }
+
+    if (!c) {
+        return 0;
+    }
+
+    for (o = b + 240; o < end && *o != 255;) {
+        if (*o == 0) {
+            o++;
+            continue;
+        }
+
+        if (o + 2 > end || o + 2 + o[1] > end) {
+            break;
+        }
+
+        if (o[0] == 53 && o[1] >= 1) {
+            type = o[2];
+        } else if (o[0] == 54 && o[1] == 4) {
+            server = get32(o + 2);
+        } else if (o[0] == 51 && o[1] == 4) {
+            lease = get32(o + 2);
+        }
+
+        o += 2 + o[1];
+    }
+
+    if (type == 2 && c->dhcp == D_SELECTING) {          /* OFFER */
+        c->offered = yiaddr;
+        c->server_ip = server;
+        memcpy(c->server_mac, frame + 6, 6);
+        c->dhcp = D_REQUESTING;
+        c->tries = 1;
+        dhcp_send(c, 3, 0, yiaddr, server);
+    } else if (type == 5 && (c->dhcp == D_REQUESTING ||
+                             c->dhcp == D_BOUND)) {    /* ACK */
+        if (server) {
+            c->server_ip = server;
+        }
+
+        memcpy(c->server_mac, frame + 6, 6);
+        dhcp_bound(c, yiaddr, lease);
+    } else if (type == 6) {                             /* NAK */
+        if (c->manual) {
+            syslog(LOG_WARNING, "DHCP server refused %s for '%s'; it keeps "
+                   "working, but consider a reservation", iptoa(c->ip),
+                   c->key);
+            c->dhcp = D_FAILED;
+        } else if (c->dhcp != D_BOUND) {
+            c->xid++;
+            dhcp_discover(c);
+        }
+    }
+
+    return 1;
+}
+
+static void dhcp_idle(struct lan_client *c)
+{
+    long n = lan_now();
+
+    switch (c->dhcp) {
+    case D_SELECTING:
+    case D_REQUESTING:
+        if (n < c->dhcp_next) {
+            break;
+        }
+
+        if (++c->tries > DHCP_TRIES) {
+            c->dhcp = D_FAILED;
+            syslog(LOG_WARNING, "no DHCP answer for '%s'%s", c->key,
+                   c->ip ? "; keeping its address" : "; using the pool");
+
+            if (!c->ip && c->presence &&
+                    (c->ip = macip_presence_lease()) != 0) {
+                announce(c);
+            }
+
+            if (!c->presence) {
+                macip_assign_ready(&c->sat);    /* falls back to the pool */
+            }
+
+            break;
+        }
+
+        if (c->dhcp == D_SELECTING) {
+            dhcp_send(c, 1, 0, 0, 0);
+        } else {
+            dhcp_send(c, 3, 0, c->manual ? c->ip : c->offered,
+                      c->manual ? 0 : c->server_ip);
+        }
+
+        break;
+
+    case D_BOUND:
+        if (n >= c->renew_at) {
+            dhcp_send(c, 3, c->ip, 0, 0);       /* renew */
+            c->renew_at = n + 60;
+        }
+
+        if (n >= c->expire_at) {
+            syslog(LOG_WARNING, "DHCP lease for '%s' (%s) expired",
+                   c->key, iptoa(c->ip));
+            c->expire_at = n + 3600;
+        }
+
+        break;
+    }
+}
+
+/* MacIP server address request (hook from macip.c) */
+int lan_assign(const struct sockaddr_at *sat, uint32_t *ip, uint32_t *mask)
+{
+    struct lan_client *c = NULL;
+
+    if (!gLan.cfg.dhcp) {
+        return -1;
+    }
+
+    for (int i = 0; i < LAN_MAX_CLIENTS && !c; i++) {
+        struct lan_client *x = &gLan.clients[i];
+
+        if (x->state != CL_FREE &&
+                x->sat.sat_addr.s_net == sat->sat_addr.s_net &&
+                x->sat.sat_addr.s_node == sat->sat_addr.s_node) {
+            c = x;
+        }
+    }
+
+    if (c && c->presence) {
+        /* an AppleTalk-only Mac that has started MacIP keeps its lease */
+        syslog(LOG_INFO, "client '%s' now uses MacIP", c->key);
+        c->presence = 0;
+    }
+
+    if (!c) {
+        for (int i = 0; i < LAN_MAX_CLIENTS && !c; i++)
+            if (gLan.clients[i].state == CL_FREE) {
+                c = &gLan.clients[i];
+            }
+
+        if (!c) {
+            return -1;
+        }
+
+        memset(c, 0, sizeof(*c));
+        c->state = CL_PENDING;
+        c->sat = *sat;
+        c->deadline = lan_now() + gLan.cfg.identify_timeout;
+        gLan.last_lookup = 0;
+        request_names();
+        return 0;
+    }
+
+    if (c->state == CL_ACTIVE && c->ip && c->dhcp == D_BOUND) {
+        *ip = c->ip;
+        *mask = gLan.cfg.client_mask;
+        return 1;
+    }
+
+    if (c->state == CL_ACTIVE && c->dhcp == D_FAILED && !c->ip) {
+        c->state = CL_FREE;     /* let the pool handle it */
+        return -1;
+    }
+
+    return 0;
+}
+
+/* track a MacIP client address outside the pool? (hook from macip.c) */
+int lan_accept_ip(uint32_t ip)
+{
+    return (ip & gLan.lan_mask) == gLan.lan_net && ip != gLan.host_ip &&
+           ip != gLan.router && ip != gLan.lan_net &&
+           ip != (gLan.lan_net | ~gLan.lan_mask);
 }
 
 /* ------------------------------------------------------------------ */
@@ -596,6 +1356,8 @@ void lan_output(char *buffer, int len)
     if (!c) {
         return;
     }
+
+    c->last_reply = lan_now();
 
     if (c->state != CL_ACTIVE) {
         if (c->nheld < LAN_HOLD && len <= MACIP_MTU) {
@@ -757,7 +1519,16 @@ void lan_input(void)
     if (type == ETHTYPE_IP && len >= ETH_HLEN_ + 20) {
         uint8_t *ip = f + ETH_HLEN_;
 
+        if (gLan.cfg.dhcp && dhcp_input(f, len)) {
+            return;
+        }
+
         if ((c = client_by_mac(f)) == NULL || get32(ip + 16) != c->ip) {
+            return;
+        }
+
+        if (c->presence) {
+            presence_ping(c, ip, len - ETH_HLEN_);
             return;
         }
 
@@ -773,6 +1544,8 @@ void lan_idle(void)
 {
     long n = lan_now();
 
+    check_idle();
+
     for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
         struct lan_client *c = &gLan.clients[i];
 
@@ -782,8 +1555,12 @@ void lan_idle(void)
             } else {
                 request_names();
             }
-        } else if (c->state == CL_ACTIVE && n >= c->next_announce) {
-            announce(c);
+        } else if (c->state == CL_ACTIVE) {
+            dhcp_idle(c);
+
+            if (c->ip && n >= c->next_announce) {
+                announce(c);
+            }
         }
     }
 
@@ -859,6 +1636,18 @@ int lan_open(const struct lan_config *cfg, uint32_t gwaddr,
     if (gLan.cfg.identify_timeout <= 0) {
         gLan.cfg.identify_timeout = 3;
     }
+
+    if (gLan.cfg.check_interval <= 0) {
+        gLan.cfg.check_interval = 30;
+    }
+
+    gLan.next_scan = lan_now() + 5;     /* let the MacIP clients settle first */
+
+    if (gLan.cfg.client_mask == 0) {
+        gLan.cfg.client_mask = 0xffffffff;
+    }
+
+    srandom((unsigned int)(lan_now() ^ getpid()));
 
     if ((gLan.fd = open("/dev/net/tun", O_RDWR)) < 0) {
         syslog(LOG_ERR, "lan: /dev/net/tun: %m");
