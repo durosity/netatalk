@@ -32,6 +32,8 @@
 #include <stdint.h>
 #include <netatalk/at.h>
 
+#include "lan_ident.h"
+
 #define LAN_KEY_LEN   80
 #define LAN_MAX_OVERRIDES 64
 
@@ -64,6 +66,5 @@ extern void lan_client_seen(uint32_t ip, const struct sockaddr_at *sat);
 extern void lan_client_gone(uint32_t ip);
 extern void lan_nbp_entry(const struct nbpnve *nve);
 
-extern int lan_parse_mac(const char *s, uint8_t mac[6]);
 
 #endif /* MACIPGW_LAN_H */
