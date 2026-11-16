@@ -43,6 +43,12 @@ extern int lan_parse_mac(const char *s, uint8_t mac[6]);
 extern int lan_identity_key(const char *ws_name, const char *cand_obj,
                             const char *cand_type, char *key, size_t keylen);
 
+/*!
+ * how much an NBP type looks like a Mac model: 2 = model name (Macintosh,
+ * Power Macintosh, PowerBook...), 1 = unknown, 0 = a known service type
+ */
+extern int lan_model_score(const char *type);
+
 /*! prefix (3 bytes) followed by the first 3 bytes of MD5(key) */
 extern void lan_derive_mac(const char *key, const uint8_t prefix[3],
                            uint8_t mac[6]);

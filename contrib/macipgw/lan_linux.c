@@ -66,6 +66,7 @@
 #define ETHTYPE_ARP     0x0806
 #define MACIP_MTU       586
 #define LAN_MAX_CLIENTS 64
+#define LAN_HOLD        4       /* packets held per client while identifying */
 #define LAN_MAX_ARP     128
 #define ARP_TTL         300     /* seconds a learned LAN mapping is kept */
 #define ARP_RETRY       1       /* seconds between ARP requests */
@@ -89,6 +90,11 @@ struct lan_client {
     char cand_obj[NBPSTRLEN + 1];
     char cand_type[NBPSTRLEN + 1];
     int cand_sock;
+    int cand_score;
+    /* packets held while the client is being identified */
+    char held[LAN_HOLD][MACIP_MTU];
+    int held_len[LAN_HOLD];
+    int nheld;
 };
 
 struct arp_entry {
@@ -101,8 +107,11 @@ struct arp_entry {
     int tries;
     uint8_t mac_from[6];        /* client that asked, for the request */
     uint32_t ip_from;
-    char pending[MACIP_MTU + 64];
-    int pending_len;
+    /* packets waiting for this next hop's MAC */
+    char pending[LAN_HOLD][MACIP_MTU];
+    int pending_len[LAN_HOLD];
+    uint32_t pending_from[LAN_HOLD];
+    int npending;
 };
 
 static struct {
@@ -225,6 +234,8 @@ static void send_arp(uint16_t op, const uint8_t eth_dst[6],
     send_frame(eth_dst, sha, ETHTYPE_ARP, a, sizeof(a));
 }
 
+static void route_out(struct lan_client *c, char *buffer, int len);
+
 static void announce(struct lan_client *c)
 {
     static const uint8_t zero[6] = { 0 };
@@ -345,6 +356,12 @@ static void activate(struct lan_client *c)
                mactoa(c->mac));
 
     announce(c);
+
+    for (int i = 0; i < c->nheld; i++) {
+        route_out(c, c->held[i], c->held_len[i]);
+    }
+
+    c->nheld = 0;
 }
 
 void lan_client_seen(uint32_t ip, const struct sockaddr_at *sat)
@@ -418,10 +435,26 @@ void lan_nbp_entry(const struct nbpnve *nve)
             continue;
         }
 
+        /* a node answers a lookup with all of its names together, so once
+           the first arrives there is little point waiting much longer */
+        if (c->deadline > lan_now() + 1) {
+            c->deadline = lan_now() + 1;
+        }
+
         if (strcasecmp(type, "Workstation") == 0) {
             snprintf(c->ws_name, sizeof(c->ws_name), "%s", obj);
-        } else if (nve->nn_sat.sat_port > c->cand_sock) {
-            /* the Responder's name:model entry sits on a high socket */
+        } else {
+            /* prefer a model-like type (the Responder's name:model entry),
+               then the highest socket */
+            int score = lan_model_score(type);
+
+            if (score == 0 || score < c->cand_score ||
+                    (score == c->cand_score &&
+                     nve->nn_sat.sat_port <= c->cand_sock)) {
+                continue;
+            }
+
+            c->cand_score = score;
             c->cand_sock = nve->nn_sat.sat_port;
             snprintf(c->cand_obj, sizeof(c->cand_obj), "%s", obj);
             snprintf(c->cand_type, sizeof(c->cand_type), "%s", type);
@@ -493,15 +526,16 @@ static void arp_learn(uint32_t ip, const uint8_t mac[6])
     a->resolved = 1;
     a->expires = lan_now() + ARP_TTL;
 
-    if (a->pending_len) {
-        struct lan_client *c = client_by_ip(a->ip_from);
+    for (int i = 0; i < a->npending; i++) {
+        struct lan_client *c = client_by_ip(a->pending_from[i]);
 
         if (c && c->state == CL_ACTIVE) {
-            send_frame(a->mac, c->mac, ETHTYPE_IP, a->pending, a->pending_len);
+            send_frame(a->mac, c->mac, ETHTYPE_IP, a->pending[i],
+                       a->pending_len[i]);
         }
-
-        a->pending_len = 0;
     }
+
+    a->npending = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -537,10 +571,8 @@ static void echo_reply(char *buffer, int len)
 void lan_output(char *buffer, int len)
 {
     const uint8_t *p = (const uint8_t *) buffer;
-    uint32_t src, dst, hop;
-    struct lan_client *c, *peer;
-    struct arp_entry *a;
-    long n = lan_now();
+    uint32_t src, dst;
+    struct lan_client *c;
 
     if (len < 20 || (p[0] >> 4) != 4) {
         return;
@@ -554,20 +586,39 @@ void lan_output(char *buffer, int len)
         return;
     }
 
-    if ((peer = client_by_ip(dst)) != NULL) {
+    if (client_by_ip(dst) != NULL) {
         gLan.to_macip(buffer, len);    /* client to client, stays on AppleTalk */
         return;
     }
 
     c = client_by_ip(src);
 
-    if (!c || c->state != CL_ACTIVE) {
-        if (gDebug & DEBUG_LAN)
+    if (!c) {
+        return;
+    }
+
+    if (c->state != CL_ACTIVE) {
+        if (c->nheld < LAN_HOLD && len <= MACIP_MTU) {
+            memcpy(c->held[c->nheld], buffer, len);
+            c->held_len[c->nheld++] = len;
+        } else if (gDebug & DEBUG_LAN) {
             printf("lan: %s not identified yet, packet dropped\n",
                    iptoa(src));
+        }
 
         return;
     }
+
+    route_out(c, buffer, len);
+}
+
+/* send a packet from an identified client towards the LAN */
+static void route_out(struct lan_client *c, char *buffer, int len)
+{
+    const uint8_t *p = (const uint8_t *) buffer;
+    uint32_t dst = get32(p + 16), hop;
+    struct arp_entry *a;
+    long n = lan_now();
 
     if (dst == 0xffffffff || dst == (gLan.lan_net | ~gLan.lan_mask)) {
         send_frame(bcast, c->mac, ETHTYPE_IP, buffer, len);
@@ -591,12 +642,14 @@ void lan_output(char *buffer, int len)
         return;
     }
 
-    /* hold the latest packet and ask for the next hop's MAC */
-    if (len <= (int) sizeof(a->pending)) {
-        memcpy(a->pending, buffer, len);
-        a->pending_len = len;
-        a->ip_from = c->ip;
+    /* hold the packet and ask for the next hop's MAC */
+    if (a->npending < LAN_HOLD && len <= MACIP_MTU) {
+        memcpy(a->pending[a->npending], buffer, len);
+        a->pending_len[a->npending] = len;
+        a->pending_from[a->npending++] = c->ip;
     }
+
+    a->ip_from = c->ip;
 
     a->resolved = 0;
 
@@ -743,7 +796,7 @@ void lan_idle(void)
 
         if (a->tries >= ARP_TRIES && a->next_try <= n) {
             a->used = 0;        /* next hop not answering */
-        } else if (a->next_try <= n && a->pending_len) {
+        } else if (a->next_try <= n && a->npending) {
             static const uint8_t zero[6] = { 0 };
             send_arp(1, bcast, a->mac_from, a->ip_from, zero, a->ip);
             a->next_try = n + ARP_RETRY;

@@ -87,6 +87,26 @@ int main(void)
     check_mac("12345678901234567890123456789012345678901234567890123456789012"
               "345678901234567890", "08:00:07:57:ed:f4");
 
+    /* model scoring, using the G3 AIO's real registrations */
+    static const struct {
+        const char *type;
+        int score;
+    } scores[] = {
+        {"  Power Macintosh", 2}, {"Macintosh II", 2}, {"PowerBook 170", 2},
+        {"Workstation", 0}, {"AFPServer", 0}, {"ARA - Personal Server", 0},
+        {"Multi-User Client", 0}, {"LaserWriter", 0}, {"", 0},
+        {"Something Else", 1},
+    };
+
+    for (size_t i = 0; i < sizeof(scores) / sizeof(scores[0]); i++) {
+        if (lan_model_score(scores[i].type) != scores[i].score) {
+            fprintf(stderr, "FAIL model score '%s': expected %d, got %d\n",
+                    scores[i].type, scores[i].score,
+                    lan_model_score(scores[i].type));
+            failures++;
+        }
+    }
+
     snprintf(t, sizeof(t), "  a  b\tc  ");
     lan_tidy(t);
     check_str("tidy", t, "a b c");

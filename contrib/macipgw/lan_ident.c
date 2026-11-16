@@ -201,3 +201,42 @@ void lan_derive_mac(const char *key, const uint8_t prefix[3], uint8_t mac[6])
     memcpy(mac, prefix, 3);
     memcpy(mac + 3, h, 3);
 }
+
+/* NBP types that are services, not a Mac's model */
+static const char *const service_types[] = {
+    "Workstation", "AFPServer", "LaserWriter", "ImageWriter", "TimeLord",
+    "netatalk", "Multi-User Client", "ProDOS16 Image", "Apple //e Boot",
+    "Apple //gs", "SNMP Agent", "IPADDRESS", "IPGATEWAY", NULL
+};
+
+/* prefixes the Responder uses for model names */
+static const char *const model_prefixes[] = {
+    "Macintosh", "Power Macintosh", "Power Mac", "PowerBook", "Mac ",
+    "iMac", "eMac", "iBook", "Performa", "Quadra", "Centris", "Workgroup Server",
+    NULL
+};
+
+int lan_model_score(const char *type)
+{
+    char t[LAN_NAME_LEN];
+
+    snprintf(t, sizeof(t), "%s", type);
+    lan_tidy(t);
+
+    if (!t[0]) {
+        return 0;
+    }
+
+    for (int i = 0; service_types[i]; i++)
+        if (strcasecmp(t, service_types[i]) == 0 ||
+                strncasecmp(t, "ARA", 3) == 0) {
+            return 0;
+        }
+
+    for (int i = 0; model_prefixes[i]; i++)
+        if (strncasecmp(t, model_prefixes[i], strlen(model_prefixes[i])) == 0) {
+            return 2;
+        }
+
+    return 1;
+}
