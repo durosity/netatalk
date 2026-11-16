@@ -1020,11 +1020,17 @@ int lan_open(const struct lan_config *cfg, uint32_t gwaddr,
     gLan.lan_net = gLan.host_ip & gLan.lan_mask;
     gLan.router = gLan.cfg.router ? gLan.cfg.router : default_router();
 
-    syslog(LOG_INFO, "LAN mode: %s on bridge %s, LAN %s", gLan.name,
-           gLan.cfg.bridge, iptoa(gLan.lan_net));
-    syslog(LOG_INFO, "LAN mode: netmask %s, router %s, MAC prefix %02x:%02x:%02x",
-           iptoa(gLan.lan_mask), iptoa(gLan.router), gLan.cfg.prefix[0],
-           gLan.cfg.prefix[1], gLan.cfg.prefix[2]);
+    {
+        /* iptoa() returns a static buffer, so copy before the next call */
+        char net[16], msk[16], rtr[16];
+        snprintf(net, sizeof(net), "%s", iptoa(gLan.lan_net));
+        snprintf(msk, sizeof(msk), "%s", iptoa(gLan.lan_mask));
+        snprintf(rtr, sizeof(rtr), "%s", iptoa(gLan.router));
+        syslog(LOG_INFO, "LAN mode: %s on bridge %s, LAN %s netmask %s, "
+               "router %s, MAC prefix %02x:%02x:%02x", gLan.name,
+               gLan.cfg.bridge, net, msk, rtr, gLan.cfg.prefix[0],
+               gLan.cfg.prefix[1], gLan.cfg.prefix[2]);
+    }
 
     if (gDebug & DEBUG_LAN) {
         printf("lan: %s on %s, LAN %s/", gLan.name, gLan.cfg.bridge,
