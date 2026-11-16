@@ -302,6 +302,9 @@ macip_options *read_options(const char *conf)
                         INISEC_GLOBAL ":appletalk presence", 0);
     options->check_interval = iniparser_getint(config,
                               INISEC_GLOBAL ":check interval", 30);
+    options->status_file = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL,
+                                               "status file",
+                                               "/run/macipgw/clients.json");
     options->dhcp = iniparser_getboolean(config, INISEC_GLOBAL ":dhcp", 0);
     options->client_netmask = INIPARSER_GETSTRDUP(config, INISEC_GLOBAL,
                               "client netmask", "255.255.255.255");
@@ -424,6 +427,8 @@ int main(int argc, char *argv[])
             gLanCfg.presence = mio->presence;
             gLanCfg.check_interval = mio->check_interval;
             gLanCfg.dhcp = mio->dhcp;
+            snprintf(gLanCfg.status_file, sizeof(gLanCfg.status_file), "%s",
+                     mio->status_file);
             gLanCfg.client_mask = atoip(mio->client_netmask);
             gLanCfg.router = mio->router[0] ? atoip(mio->router) : 0;
             uint8_t m[6];
@@ -545,6 +550,7 @@ int main(int argc, char *argv[])
         CONFIG_ARG_FREE(mio->bridge)
         CONFIG_ARG_FREE(mio->mac_prefix)
         CONFIG_ARG_FREE(mio->router)
+        CONFIG_ARG_FREE(mio->status_file)
         CONFIG_ARG_FREE(mio->client_netmask)
     }
 

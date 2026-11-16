@@ -40,6 +40,7 @@ typedef struct {
     int presence;               /* LAN mode: AppleTalk-only Macs get a MAC/IP */
     int check_interval;         /* LAN mode: seconds between echo checks */
     int dhcp;                   /* LAN mode: lease addresses via DHCP */
+    char *status_file;          /* LAN mode: JSON status of clients */
     char *client_netmask;       /* LAN mode: mask for MacIP server clients */
 } macip_options;
 

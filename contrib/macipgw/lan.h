@@ -53,6 +53,7 @@ struct lan_config {
     int check_interval;             /* seconds between echo checks and scans */
     int dhcp;                       /* lease addresses from the LAN's DHCP */
     uint32_t client_mask;           /* netmask given to MacIP server clients */
+    char status_file[256];          /* JSON list of clients, "" = none */
     int noverrides;
     struct lan_override overrides[LAN_MAX_OVERRIDES];
 };

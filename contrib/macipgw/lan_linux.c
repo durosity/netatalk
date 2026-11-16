@@ -35,6 +35,7 @@
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/time.h>
+#include <sys/stat.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 
@@ -133,6 +134,7 @@ struct lan_client {
     int reassigning;            /* checking the address with DHCP first */
     int assign_ok;              /* the check is done: answer the request */
     long answered_at;
+    long first_seen;            /* for the status file */
 };
 
 /* a node seen in an NBP scan, for AppleTalk-only presence */
@@ -179,6 +181,9 @@ static struct {
     long next_scan;             /* next presence scan */
     long scan_time;             /* when the current scan was sent */
     int scan_pending;
+    long started;
+    int status_dirty;           /* clients changed: rewrite the status file */
+    long next_status;
 } gLan;
 
 static const uint8_t bcast[6] = { 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
@@ -407,6 +412,11 @@ static void activate(struct lan_client *c)
 
     c->state = CL_ACTIVE;
     c->last_reply = lan_now();
+    gLan.status_dirty = 1;
+
+    if (!c->first_seen) {
+        c->first_seen = c->last_reply;
+    }
     syslog(LOG_INFO, "client %s (%u.%u) is '%s', MAC %s%s%s", iptoa(c->ip),
            ntohs(c->sat.sat_addr.s_net), c->sat.sat_addr.s_node, c->key,
            mactoa(c->mac), c->mac_fixed ? " (configured)" : "",
@@ -435,6 +445,7 @@ static void presence_drop(struct lan_client *c, const char *why)
     dhcp_release(c);
     macip_presence_release(c->ip);
     c->state = CL_FREE;
+    gLan.status_dirty = 1;
 }
 
 void lan_client_seen(uint32_t ip, const struct sockaddr_at *sat)
@@ -497,6 +508,7 @@ void lan_client_gone(uint32_t ip)
         syslog(LOG_INFO, "client %s ('%s') gone", iptoa(ip), c->key);
         dhcp_release(c);
         c->state = CL_FREE;
+        gLan.status_dirty = 1;
     }
 }
 
@@ -865,6 +877,7 @@ static void check_idle(void)
             dhcp_release(c);
             macip_release_lease(c->ip);
             c->state = CL_FREE;
+            gLan.status_dirty = 1;
         }
     }
 }
@@ -1021,6 +1034,7 @@ static void dhcp_bound(struct lan_client *c, uint32_t yiaddr, uint32_t lease)
     }
 
     c->dhcp = D_BOUND;
+    gLan.status_dirty = 1;
     c->renew_at = n + lease / 2;
     c->expire_at = n + lease;
 
@@ -1614,11 +1628,167 @@ void lan_input(void)
 /* housekeeping                                                        */
 /* ------------------------------------------------------------------ */
 
+/* ------------------------------------------------------------------ */
+/* status file                                                         */
+/* ------------------------------------------------------------------ */
+
+/* NBP names are Mac Roman: bytes above 0x7e are written as \u00XX, one per
+   byte, and readers convert them (latin-1 bytes -> mac_roman) */
+static void json_str(FILE *f, const char *s)
+{
+    fputc('"', f);
+
+    for (const unsigned char *p = (const unsigned char *) s; *p; p++) {
+        if (*p == '"' || *p == '\\') {
+            fprintf(f, "\\%c", *p);
+        } else if (*p < 0x20 || *p > 0x7e) {
+            fprintf(f, "\\u%04x", *p);
+        } else {
+            fputc(*p, f);
+        }
+    }
+
+    fputc('"', f);
+}
+
+static void json_ip(FILE *f, uint32_t ip)
+{
+    if (ip) {
+        fprintf(f, "\"%s\"", iptoa(ip));
+    } else {
+        fputs("null", f);
+    }
+}
+
+static const char *dhcp_state_name(int d)
+{
+    switch (d) {
+    case D_SELECTING:
+        return "discovering";
+
+    case D_REQUESTING:
+        return "requesting";
+
+    case D_BOUND:
+        return "bound";
+
+    case D_FAILED:
+        return "failed";
+
+    default:
+        return "none";
+    }
+}
+
+static void write_status(void)
+{
+    const char *path = gLan.cfg.status_file;
+    char tmp[sizeof(gLan.cfg.status_file) + 8];
+    FILE *f;
+    int first = 1;
+
+    if (!path[0]) {
+        return;
+    }
+
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+
+    if ((f = fopen(tmp, "w")) == NULL) {
+        static int warned;
+
+        if (!warned++) {
+            syslog(LOG_WARNING, "cannot write status file %s: %m", tmp);
+        }
+
+        return;
+    }
+
+    fprintf(f, "{\n  \"version\": 1,\n  \"updated\": %ld,\n"
+            "  \"started\": %ld,\n  \"gateway\": {\n", lan_now(),
+            gLan.started);
+    fprintf(f, "    \"tap\": \"%s\", \"bridge\": \"%s\",\n", gLan.name,
+            gLan.cfg.bridge);
+    fprintf(f, "    \"lan\": ");
+    json_ip(f, gLan.lan_net);
+    fprintf(f, ", \"netmask\": ");
+    json_ip(f, gLan.lan_mask);
+    fprintf(f, ", \"router\": ");
+    json_ip(f, gLan.router);
+    fprintf(f, ", \"macip_address\": ");
+    json_ip(f, gLan.gwaddr);
+    fprintf(f, ",\n    \"dhcp\": %s, \"appletalk_presence\": %s, "
+            "\"check_interval\": %d\n  },\n  \"clients\": [",
+            gLan.cfg.dhcp ? "true" : "false",
+            gLan.cfg.presence ? "true" : "false", gLan.cfg.check_interval);
+
+    for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
+        const struct lan_client *c = &gLan.clients[i];
+        char name[LAN_KEY_LEN], *model;
+
+        if (c->state == CL_FREE) {
+            continue;
+        }
+
+        /* identity is "name:model" (NBP names cannot contain ':') */
+        snprintf(name, sizeof(name), "%s", c->key);
+        model = strchr(name, ':');
+
+        if (model) {
+            *model++ = 0;
+        } else {
+            model = name + strlen(name);
+        }
+
+        fprintf(f, "%s\n    {\"identity\": ", first ? "" : ",");
+        first = 0;
+        json_str(f, c->key);
+        fprintf(f, ", \"name\": ");
+        json_str(f, name);
+        fprintf(f, ", \"model\": ");
+        json_str(f, model);
+        fprintf(f, ",\n     \"hostname\": ");
+        json_str(f, c->hostname);
+        fprintf(f, ", \"ip\": ");
+        json_ip(f, c->ip);
+        fprintf(f, ", \"mac\": \"%s\", \"mac_configured\": %s,\n",
+                c->state == CL_ACTIVE ? mactoa(c->mac) : "",
+                c->mac_fixed ? "true" : "false");
+        fprintf(f, "     \"kind\": \"%s\", \"state\": \"%s\", "
+                "\"node\": \"%u.%u\",\n",
+                c->presence ? "appletalk" : "macip",
+                c->state == CL_ACTIVE ? "active" : "identifying",
+                ntohs(c->sat.sat_addr.s_net), c->sat.sat_addr.s_node);
+        fprintf(f, "     \"dhcp\": \"%s\", \"lease_expires\": ",
+                dhcp_state_name(c->dhcp));
+
+        if (c->dhcp == D_BOUND) {
+            fprintf(f, "%ld", c->expire_at);
+        } else {
+            fputs("null", f);
+        }
+
+        fprintf(f, ", \"last_answer\": %ld, \"first_seen\": %ld}",
+                c->last_reply, c->first_seen);
+    }
+
+    fprintf(f, "\n  ]\n}\n");
+
+    if (fclose(f) == 0) {
+        rename(tmp, path);
+    }
+}
+
 void lan_idle(void)
 {
     long n = lan_now();
 
     check_idle();
+
+    if (gLan.status_dirty || n >= gLan.next_status) {
+        gLan.status_dirty = 0;
+        gLan.next_status = n + 10;
+        write_status();
+    }
 
     for (int i = 0; i < LAN_MAX_CLIENTS; i++) {
         struct lan_client *c = &gLan.clients[i];
@@ -1716,6 +1886,19 @@ int lan_open(const struct lan_config *cfg, uint32_t gwaddr,
     }
 
     gLan.next_scan = lan_now() + 5;     /* let the MacIP clients settle first */
+    gLan.started = lan_now();
+
+    if (gLan.cfg.status_file[0]) {
+        /* create the status file's directory (one level, e.g. /run/macipgw) */
+        char dir[sizeof(gLan.cfg.status_file)];
+        snprintf(dir, sizeof(dir), "%s", gLan.cfg.status_file);
+        char *slash = strrchr(dir, '/');
+
+        if (slash && slash != dir) {
+            *slash = 0;
+            mkdir(dir, 0755);
+        }
+    }
 
     if (gLan.cfg.client_mask == 0) {
         gLan.cfg.client_mask = 0xffffffff;
