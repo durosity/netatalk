@@ -707,6 +707,26 @@ static int node_has_macip_client(uint16_t net, uint8_t node)
 }
 
 /* after a scan: give every Mac that is only on AppleTalk a presence */
+/*
+ * A Mac's names changed (renamed in the Chooser or Sharing Setup and
+ * restarted): give it its new identity, MAC and hostname, keep its address
+ * and move the DHCP lease to the new MAC.
+ */
+static void client_renamed(struct lan_client *c, const struct at_node *a,
+                           const char *key)
+{
+    syslog(LOG_INFO, "client %s renamed from '%s' to '%s'", iptoa(c->ip),
+           c->key, key);
+    dhcp_release(c);
+    snprintf(c->ws_name, sizeof(c->ws_name), "%s", a->ws_name);
+    snprintf(c->cand_obj, sizeof(c->cand_obj), "%s", a->cand_obj);
+    snprintf(c->cand_type, sizeof(c->cand_type), "%s", a->cand_type);
+    c->cand_sock = a->cand_sock;
+    c->cand_score = a->cand_score;
+    c->hostname[0] = 0;
+    activate(c);
+}
+
 static void presence_evaluate(void)
 {
     struct sockaddr_at me;
@@ -724,18 +744,29 @@ static void presence_evaluate(void)
             continue;
         }
 
-        if ((a->net == me.sat_addr.s_net && a->node == me.sat_addr.s_node) ||
-                node_has_macip_client(a->net, a->node)) {
-            continue;           /* the gateway itself, or already on MacIP */
+        if (a->net == me.sat_addr.s_net && a->node == me.sat_addr.s_node) {
+            continue;           /* the gateway itself */
         }
 
-        if (!a->ws_name[0] && a->cand_score < 2) {
+        if ((!a->ws_name[0] && a->cand_score < 2) ||
+                lan_identity_key(a->ws_name, a->cand_obj, a->cand_type, key,
+                                 sizeof(key)) < 0) {
             continue;           /* not recognisably a Mac (a printer, say) */
         }
 
-        if (lan_identity_key(a->ws_name, a->cand_obj, a->cand_type, key,
-                             sizeof(key)) < 0) {
-            continue;
+        /* a known client on this node under another name: renamed */
+        for (int j = 0; j < LAN_MAX_CLIENTS; j++) {
+            struct lan_client *x = &gLan.clients[j];
+
+            if (x->state == CL_ACTIVE && x->sat.sat_addr.s_net == a->net &&
+                    x->sat.sat_addr.s_node == a->node &&
+                    strcasecmp(x->key, key) != 0) {
+                client_renamed(x, a, key);
+            }
+        }
+
+        if (node_has_macip_client(a->net, a->node)) {
+            continue;           /* already on MacIP */
         }
 
         for (int j = 0; j < LAN_MAX_CLIENTS && !c; j++) {
@@ -1209,7 +1240,10 @@ int lan_assign(const struct sockaddr_at *sat, uint32_t *ip, uint32_t *mask)
         return 0;
     }
 
-    if (c->state == CL_ACTIVE && c->ip && c->dhcp == D_BOUND) {
+    /* bound, or refused by the DHCP server but already using an address
+       (it keeps working, see dhcp_input): answer with that address */
+    if (c->state == CL_ACTIVE && c->ip &&
+            (c->dhcp == D_BOUND || c->dhcp == D_FAILED)) {
         *ip = c->ip;
         *mask = gLan.cfg.client_mask;
         return 1;
