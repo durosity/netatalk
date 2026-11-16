@@ -862,6 +862,7 @@ static void check_idle(void)
         } else {
             syslog(LOG_INFO, "client %s ('%s') stopped answering, gone",
                    iptoa(c->ip), c->key);
+            dhcp_release(c);
             macip_release_lease(c->ip);
             c->state = CL_FREE;
         }
@@ -878,28 +879,6 @@ static int in_pool(uint32_t ip)
 }
 
 /* "G3 AIO:Power Macintosh" -> "G3-AIO" */
-static void make_hostname(const char *key, char *out, size_t len)
-{
-    size_t o = 0;
-    int dash = 1;
-
-    for (const char *p = key; *p && *p != ':' && o + 1 < len; p++) {
-        if (isalnum((unsigned char) *p)) {
-            out[o++] = *p;
-            dash = 0;
-        } else if (!dash) {
-            out[o++] = '-';
-            dash = 1;
-        }
-    }
-
-    while (o > 0 && out[o - 1] == '-') {
-        o--;
-    }
-
-    out[o] = 0;
-}
-
 /* build and broadcast (or unicast) a DHCP message from the client */
 static void dhcp_send(struct lan_client *c, int type, uint32_t ciaddr,
                       uint32_t req_ip, uint32_t server)
@@ -1006,7 +985,7 @@ static void dhcp_start(struct lan_client *c)
     }
 
     if (!c->hostname[0]) {
-        make_hostname(c->key, c->hostname, sizeof(c->hostname));
+        lan_make_hostname(c->key, c->hostname, sizeof(c->hostname));
     }
     c->xid = (uint32_t) random();
     c->tries = 1;
@@ -1295,7 +1274,7 @@ int lan_assign(const struct sockaddr_at *sat, uint32_t *ip, uint32_t *mask)
        given, so check with the DHCP server first: an address reserved for
        it since its last lease is picked up here. */
     if (!c->hostname[0]) {
-        make_hostname(c->key, c->hostname, sizeof(c->hostname));
+        lan_make_hostname(c->key, c->hostname, sizeof(c->hostname));
     }
 
     c->reassigning = 1;

@@ -49,6 +49,13 @@ extern int lan_identity_key(const char *ws_name, const char *cand_obj,
  */
 extern int lan_model_score(const char *type);
 
+/*!
+ * DHCP hostname from an identity key: the name part, with anything other
+ * than ASCII letters and digits collapsed to '-' ("G3 AIO:..." -> "G3-AIO").
+ * Empty if nothing usable is left.
+ */
+extern void lan_make_hostname(const char *key, char *out, size_t len);
+
 /*! prefix (3 bytes) followed by the first 3 bytes of MD5(key) */
 extern void lan_derive_mac(const char *key, const uint8_t prefix[3],
                            uint8_t mac[6]);

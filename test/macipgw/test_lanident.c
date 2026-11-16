@@ -107,6 +107,31 @@ int main(void)
         }
     }
 
+    /* hostnames */
+    static const struct {
+        const char *key, *host;
+    } hosts[] = {
+        {"G3 AIO:Power Macintosh", "G3-AIO"},
+        {"Macintosh II:Macintosh II", "Macintosh-II"},
+        {"Mac LC 520:Macintosh LC 520", "Mac-LC-520"},
+        {"node 9.85", "node-9-85"},
+        {"Mike\xd5s Mac:Macintosh SE", "Mike-s-Mac"},   /* Mac Roman \xd5 = ' */
+        {"  --Studio--  :Quadra", "Studio"},
+        {"***:Macintosh", ""},
+    };
+
+    for (size_t i = 0; i < sizeof(hosts) / sizeof(hosts[0]); i++) {
+        char h[33];
+        lan_make_hostname(hosts[i].key, h, sizeof(h));
+        check_str("hostname", h, hosts[i].host);
+    }
+
+    {
+        char h[8];                  /* truncated to the buffer */
+        lan_make_hostname("Macintosh Quadra 950:x", h, sizeof(h));
+        check_str("hostname truncated", h, "Macinto");
+    }
+
     snprintf(t, sizeof(t), "  a  b\tc  ");
     lan_tidy(t);
     check_str("tidy", t, "a b c");

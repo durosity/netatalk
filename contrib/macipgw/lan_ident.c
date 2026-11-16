@@ -240,3 +240,27 @@ int lan_model_score(const char *type)
 
     return 1;
 }
+
+void lan_make_hostname(const char *key, char *out, size_t len)
+{
+    size_t o = 0;
+    int dash = 1;
+
+    /* the name part of "name:model": letters and digits, anything else
+       (spaces, punctuation, Mac Roman characters) becomes a single '-' */
+    for (const char *p = key; *p && *p != ':' && o + 1 < len; p++) {
+        if (isalnum((unsigned char) *p) && !((unsigned char) *p & 0x80)) {
+            out[o++] = *p;
+            dash = 0;
+        } else if (!dash) {
+            out[o++] = '-';
+            dash = 1;
+        }
+    }
+
+    while (o > 0 && out[o - 1] == '-') {
+        o--;
+    }
+
+    out[o] = 0;
+}
