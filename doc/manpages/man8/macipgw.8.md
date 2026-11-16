@@ -98,25 +98,84 @@ address. **macipgw** answers ARP for active clients, announces them
 periodically, resolves next hops itself and frames packets with the
 client's MAC, so no NAT, proxy ARP or kernel routing is needed and each
 client appears in the router's client list. Packets from the LAN that
-exceed the MacIP MTU are fragmented.
+exceed the MacIP MTU are fragmented. The LAN, its netmask and the router
+are taken from the bridge's address and the host's default route.
 
-The client address pool (*network* and *netmask*) must be a range of the
-LAN that no other host or DHCP server uses. The LAN itself, its netmask
-and the router are taken from the bridge's address and the host's
-default route.
+atalkd must run on the bridge rather than on the interface inside it,
+and a seed router is needed for clients to be found reliably, for
+example *br0 -router -phase 2 -net 9-10 -zone "Vintage"* in
+*atalkd.conf*.
 
-Each client's MAC address is derived from the name and model it
-registers over NBP: its Computer Name (*Workstation*) on System 7 and
-later, or the Responder entry on System 6, giving an identity such as
-"G3 AIO:Power Macintosh" or "Mike:Macintosh II". The MAC is the
-configured prefix followed by the first three bytes of the MD5 of that
-identity, so it stays the same as long as the Mac keeps its name. Macs
-that register no name are identified by their AppleTalk node number. If
-a derived MAC is found in use by another device, the next one is tried
-and a warning is logged.
+## Identity and MAC addresses
 
-Any client's MAC can be fixed in a *[clients]* section, keyed by
-identity, IP address or "node *net*.*node*".
+Each client's MAC address is derived from the names it registers over
+NBP from its AppleTalk node: its Computer Name (*Workstation*) on System 7
+and later, and the Responder entry that pairs a name with the Mac's model
+(System 6's Responder uses the Chooser name). Together they give an
+identity such as "G3 AIO:Power Macintosh" or "Macintosh II:Macintosh II".
+Service types such as *AFPServer* are ignored when choosing the model.
+The MAC is the configured prefix followed by the first three bytes of the
+MD5 of the identity, so it stays the same as long as the Mac keeps its
+name; renaming a Mac gives it a new MAC. Macs that register no name are
+identified by their AppleTalk node number, which is usually but not
+always stable. If a derived MAC is found in use by another device, the
+next one is tried and a warning is logged.
+
+New clients are identified as soon as their names arrive (normally well
+under a second); packets sent meanwhile are held, not dropped. A Mac that
+is renamed and restarted is noticed at the next scan (see *appletalk
+presence*): it gets its new identity, MAC and hostname and keeps its
+address, and the old MAC's DHCP lease is released.
+
+## Addresses
+
+With *dhcp = yes*, **macipgw** runs a DHCP client for each Mac, using
+the Mac's MAC address and sending its name as the hostname (option 12;
+"G3 AIO" becomes "G3-AIO"), so the DHCP server and router list each Mac
+by name and fixed addresses can be reserved there as for any other
+device. Requests carry the same parameter list as the Mac OS 9 DHCP
+client, so DHCP fingerprinting recognises the clients as Macs. Leases
+are renewed at half their lifetime and released when a Mac goes.
+
+A Mac that asks the MacIP server for an address (Open Transport
+"Using MacIP server", MacTCP "Server") is held while **macipgw**
+identifies it and checks with the DHCP server: it keeps its address if
+the server agrees and otherwise gets a fresh lease, so a reservation
+made since its last lease takes effect at its next restart. Classic Mac
+OS cannot change address while running; if the server refuses an
+address at renewal, the Mac moves when it next asks. A Mac configured
+with a fixed address keeps it, and **macipgw** asks the DHCP server to
+confirm it, logging a warning if the server refuses.
+
+The MacIP server tells clients to use *client netmask*, by default
+255.255.255.255, so that they send everything, including traffic for
+hosts on their own LAN, through the gateway rather than looking those
+hosts up over NBP. Open Transport (Mac OS 8/9) and MacTCP accept it.
+
+The pool (*network* and *netmask*) is used when *dhcp* is off, and as a
+fallback when no DHCP server answers. It must be a range of the LAN that
+no other host or DHCP server uses.
+
+## Presence and liveness
+
+Every *check interval* each client is sent an AppleTalk Echo; a client
+that misses three checks in a row is treated as gone: it is no longer
+announced or answered for, and its lease or pool address is freed.
+Routers may take much longer than that to show it offline.
+
+With *appletalk presence = yes*, Macs that run AppleTalk but not MacIP
+(no MacTCP or TCP/IP installed) get a presence on the LAN too. Every
+*check interval* **macipgw** looks up the names on the AppleTalk network
+and treats any node with a *Workstation* or a Responder model entry as a
+Mac; printers and the gateway itself are skipped. Each one gets the
+identity, MAC, hostname and address it would have as a MacIP client.
+ARP for that address is answered, and an ICMP echo request to it is
+answered only when the Mac replies to an AppleTalk Echo, so pinging the
+address shows whether the Mac is switched on. The Mac itself cannot use
+IP. A Mac that later starts using MacIP keeps its identity, MAC and
+lease. The scan is also what notices renamed Macs.
+
+## Options
 
 LAN mode options, in the *[Global]* section:
 
@@ -127,6 +186,14 @@ LAN mode options, in the *[Global]* section:
 **bridge** = *name*
 
 > The bridge holding the LAN interface (default *br0*).
+
+**dhcp** = *yes* | *no*
+
+> Lease client addresses from the LAN's DHCP server (default *no*).
+
+**client netmask** = *address*
+
+> Netmask given to MacIP server clients (default 255.255.255.255).
 
 **mac prefix** = *xx:xx:xx*
 
@@ -142,24 +209,27 @@ LAN mode options, in the *[Global]* section:
 
 **identify timeout** = *seconds*
 
-> How long to wait for a new client's NBP names (default 3).
+> Longest wait for a new client's NBP names (default 3).
 
 **check interval** = *seconds*
 
-> How often each client is checked with an AppleTalk Echo (default 30).
-A client that misses three checks in a row is treated as gone: its
-address is freed and it is no longer announced on the LAN.
+> How often clients are checked and the network scanned (default 30).
 
 **appletalk presence** = *yes* | *no*
 
-> Also give Macs that run AppleTalk but not MacIP a presence on the LAN
-(default *no*). Every *check interval* **macipgw** looks up the names on
-the AppleTalk network and treats any node with a *Workstation* or a
-Responder model entry as a Mac. Each one gets the identity and MAC it
-would have as a MacIP client and an address from the pool. ARP for that
-address is answered, and an ICMP echo request to it is answered only
-when the Mac replies to an AppleTalk Echo, so pinging the address shows
-whether the Mac is switched on. The Mac itself cannot use IP.
+> Give AppleTalk-only Macs a presence on the LAN (default *no*).
+
+The optional *[clients]* section fixes a client's MAC, and optionally its
+hostname, keyed by identity, IP address or "node *net*.*node*":
+
+    [clients]
+    G3 AIO:Power Macintosh = 08:00:07:b8:23:66
+    10.0.9.60 = 08:00:07:12:34:56, Mac-Plus
+    node 9.85 = 08:00:07:ab:cd:ef
+
+Keys are not case-sensitive. Use a client's real Ethernet MAC to make it
+the same device on the LAN whether it is connected by Ethernet or by
+LocalTalk (but not both at once).
 
 # Examples
 
@@ -186,19 +256,22 @@ the zone Remote Users.
     [Global]
     mode = lan
     bridge = br0
+    dhcp = yes
+    appletalk presence = yes
     network = 10.0.9.240
     netmask = 255.255.255.240
     nameserver = 10.0.9.1
     zone = Vintage
-    appletalk presence = yes
 
     [clients]
-    G3 AIO:Power Macintosh = 08:00:07:b8:23:66
-    10.0.9.250 = 02:00:00:00:00:01
+    Macintosh II:Macintosh II = 08:00:07:95:8d:dc, Mac-II
+
+Clients lease addresses from the LAN's DHCP server; 10.0.9.240/28 is the
+fallback pool.
 
 # See Also
 
-tun(4), ip(4), atalkd(8), syslog(3), syslogd(8)
+tun(4), ip(4), atalkd(8), atalkd.conf(5), syslog(3), syslogd(8)
 
 # Bugs
 
