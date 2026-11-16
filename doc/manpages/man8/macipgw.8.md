@@ -144,6 +144,23 @@ LAN mode options, in the *[Global]* section:
 
 > How long to wait for a new client's NBP names (default 3).
 
+**check interval** = *seconds*
+
+> How often each client is checked with an AppleTalk Echo (default 30).
+A client that misses three checks in a row is treated as gone: its
+address is freed and it is no longer announced on the LAN.
+
+**appletalk presence** = *yes* | *no*
+
+> Also give Macs that run AppleTalk but not MacIP a presence on the LAN
+(default *no*). Every *check interval* **macipgw** looks up the names on
+the AppleTalk network and treats any node with a *Workstation* or a
+Responder model entry as a Mac. Each one gets the identity and MAC it
+would have as a MacIP client and an address from the pool. ARP for that
+address is answered, and an ICMP echo request to it is answered only
+when the Mac replies to an AppleTalk Echo, so pinging the address shows
+whether the Mac is switched on. The Mac itself cannot use IP.
+
 # Examples
 
 ## Example: macipgw invocation
@@ -173,6 +190,7 @@ the zone Remote Users.
     netmask = 255.255.255.240
     nameserver = 10.0.9.1
     zone = Vintage
+    appletalk presence = yes
 
     [clients]
     G3 AIO:Power Macintosh = 08:00:07:b8:23:66
