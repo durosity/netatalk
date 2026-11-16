@@ -129,6 +129,10 @@ struct lan_client {
     uint8_t server_mac[6];
     long renew_at, expire_at;
     char hostname[33];
+    /* MacIP server requests (the Mac starting TCP/IP) */
+    int reassigning;            /* checking the address with DHCP first */
+    int assign_ok;              /* the check is done: answer the request */
+    long answered_at;
 };
 
 /* a node seen in an NBP scan, for AppleTalk-only presence */
@@ -1041,8 +1045,20 @@ static void dhcp_bound(struct lan_client *c, uint32_t yiaddr, uint32_t lease)
     c->renew_at = n + lease / 2;
     c->expire_at = n + lease;
 
-    if (!c->ip) {
+    if (yiaddr && (!c->manual || !c->ip)) {
+        if (c->ip && c->ip != yiaddr) {
+            char old[16];
+            snprintf(old, sizeof(old), "%s", iptoa(c->ip));
+            syslog(LOG_INFO, "client '%s' moves from %s to %s", c->key, old,
+                   iptoa(yiaddr));
+        }
+
         c->ip = yiaddr;
+    }
+
+    if (c->reassigning) {       /* a MacIP server request is waiting */
+        c->reassigning = 0;
+        c->assign_ok = 1;
     }
 
     if (first) {
@@ -1137,6 +1153,10 @@ static int dhcp_input(const uint8_t *frame, int len)
         } else if (c->dhcp != D_BOUND) {
             c->xid++;
             dhcp_discover(c);
+        } else {
+            syslog(LOG_INFO, "DHCP server no longer gives %s to '%s'; it "
+                   "moves at its next restart", iptoa(c->ip), c->key);
+            c->dhcp = D_FAILED;
         }
     }
 
@@ -1164,8 +1184,13 @@ static void dhcp_idle(struct lan_client *c)
                 announce(c);
             }
 
+            if (c->reassigning) {
+                c->reassigning = 0;
+                c->assign_ok = (c->ip != 0);    /* its address, or the pool */
+            }
+
             if (!c->presence) {
-                macip_assign_ready(&c->sat);    /* falls back to the pool */
+                macip_assign_ready(&c->sat);
             }
 
             break;
@@ -1234,24 +1259,55 @@ int lan_assign(const struct sockaddr_at *sat, uint32_t *ip, uint32_t *mask)
         memset(c, 0, sizeof(*c));
         c->state = CL_PENDING;
         c->sat = *sat;
+        c->reassigning = 1;     /* answer once identified and leased */
         c->deadline = lan_now() + gLan.cfg.identify_timeout;
         gLan.last_lookup = 0;
         request_names();
         return 0;
     }
 
-    /* bound, or refused by the DHCP server but already using an address
-       (it keeps working, see dhcp_input): answer with that address */
-    if (c->state == CL_ACTIVE && c->ip &&
-            (c->dhcp == D_BOUND || c->dhcp == D_FAILED)) {
+    if (c->state != CL_ACTIVE) {
+        return 0;               /* still being identified */
+    }
+
+    long n = lan_now();
+
+    /* the check below has finished; also repeat the answer for the Mac's
+       retransmissions of the same request */
+    if (c->ip && (c->assign_ok || n - c->answered_at < 15)) {
+        c->assign_ok = 0;
+        c->answered_at = n;
         *ip = c->ip;
         *mask = gLan.cfg.client_mask;
         return 1;
     }
 
-    if (c->state == CL_ACTIVE && c->dhcp == D_FAILED && !c->ip) {
-        c->state = CL_FREE;     /* let the pool handle it */
+    if (c->reassigning) {
+        return 0;
+    }
+
+    if (c->dhcp == D_FAILED && !c->ip) {
+        c->state = CL_FREE;     /* no DHCP: let the pool handle it */
         return -1;
+    }
+
+    /* The Mac is starting TCP/IP and will take whatever address it is
+       given, so check with the DHCP server first: an address reserved for
+       it since its last lease is picked up here. */
+    if (!c->hostname[0]) {
+        make_hostname(c->key, c->hostname, sizeof(c->hostname));
+    }
+
+    c->reassigning = 1;
+    c->manual = 0;
+    c->xid = (uint32_t) random();
+    c->tries = 1;
+
+    if (c->ip && !in_pool(c->ip)) {
+        c->dhcp = D_REQUESTING;             /* may it keep this one? */
+        dhcp_send(c, 3, 0, c->ip, 0);
+    } else {
+        dhcp_discover(c);
     }
 
     return 0;
