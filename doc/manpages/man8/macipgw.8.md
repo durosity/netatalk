@@ -87,6 +87,63 @@ Configure routing or NAT on the host system separately if MacIP clients
 should reach IP networks beyond the Netatalk host. **macipgw** only
 creates and manages the tunnel interface used for the MacIP subnet.
 
+# LAN Mode (Linux)
+
+With *mode = lan* in *macipgw.conf*, **macipgw** puts MacIP clients
+directly on the host's local network instead of behind a tunnel. It
+creates a TAP interface, adds it to an existing Linux bridge that holds
+the LAN interface and the host's own IPv4 address, and then presents
+each client on the LAN as a separate host with its own Ethernet MAC
+address. **macipgw** answers ARP for active clients, announces them
+periodically, resolves next hops itself and frames packets with the
+client's MAC, so no NAT, proxy ARP or kernel routing is needed and each
+client appears in the router's client list. Packets from the LAN that
+exceed the MacIP MTU are fragmented.
+
+The client address pool (*network* and *netmask*) must be a range of the
+LAN that no other host or DHCP server uses. The LAN itself, its netmask
+and the router are taken from the bridge's address and the host's
+default route.
+
+Each client's MAC address is derived from the name and model it
+registers over NBP: its Computer Name (*Workstation*) on System 7 and
+later, or the Responder entry on System 6, giving an identity such as
+"G3 AIO:Power Macintosh" or "Mike:Macintosh II". The MAC is the
+configured prefix followed by the first three bytes of the MD5 of that
+identity, so it stays the same as long as the Mac keeps its name. Macs
+that register no name are identified by their AppleTalk node number. If
+a derived MAC is found in use by another device, the next one is tried
+and a warning is logged.
+
+Any client's MAC can be fixed in a *[clients]* section, keyed by
+identity, IP address or "node *net*.*node*".
+
+LAN mode options, in the *[Global]* section:
+
+**mode** = *tun* | *lan*
+
+> *tun* (default) uses a tunnel interface as described above.
+
+**bridge** = *name*
+
+> The bridge holding the LAN interface (default *br0*).
+
+**mac prefix** = *xx:xx:xx*
+
+> First three bytes of derived MAC addresses (default *08:00:07*).
+
+**router** = *address*
+
+> Next hop for traffic leaving the LAN (default: the host's default route).
+
+**announce interval** = *seconds*
+
+> How often each client is announced with a gratuitous ARP (default 60).
+
+**identify timeout** = *seconds*
+
+> How long to wait for a new client's NBP names (default 3).
+
 # Examples
 
 ## Example: macipgw invocation
@@ -107,6 +164,20 @@ the zone Remote Users.
     zone = My Zone
     unprivileged user = foobar
 
+## Example: LAN mode
+
+    [Global]
+    mode = lan
+    bridge = br0
+    network = 10.0.9.240
+    netmask = 255.255.255.240
+    nameserver = 10.0.9.1
+    zone = Vintage
+
+    [clients]
+    G3 AIO:Power Macintosh = 08:00:07:b8:23:66
+    10.0.9.250 = 02:00:00:00:00:01
+
 # See Also
 
 tun(4), ip(4), atalkd(8), syslog(3), syslogd(8)
@@ -115,6 +186,8 @@ tun(4), ip(4), atalkd(8), syslog(3), syslogd(8)
 
 No information besides the log messages is available on which AppleTalk
 devices are using the gateway.
+
+LAN mode is available on Linux only.
 
 # Author
 
