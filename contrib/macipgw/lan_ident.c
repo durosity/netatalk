@@ -168,6 +168,37 @@ int lan_parse_mac(const char *s, uint8_t mac[6])
 }
 
 
+/*
+ * Two NBP object names for the same Mac. When the Responder finds its name
+ * already registered (for example a stale entry after a quick restart),
+ * classic Mac OS registers it again with "-1", "-2", ... appended; ignore
+ * such a suffix on either name.
+ */
+static int same_mac_name(const char *a, const char *b)
+{
+    size_t la = strlen(a), lb = strlen(b);
+
+    if (strcasecmp(a, b) == 0) {
+        return 1;
+    }
+
+    /* strip "-<digits>" from the longer one and compare again */
+    const char *l = la > lb ? a : b, *sh = la > lb ? b : a;
+    size_t ll = la > lb ? la : lb, ls = la > lb ? lb : la;
+
+    if (ll < ls + 2 || l[ls] != '-' || strncasecmp(l, sh, ls) != 0) {
+        return 0;
+    }
+
+    for (size_t i = ls + 1; i < ll; i++) {
+        if (!isdigit((unsigned char) l[i])) {
+            return 0;
+        }
+    }
+
+    return 1;
+}
+
 int lan_identity_key(const char *ws_name, const char *cand_obj,
                      const char *cand_type, char *key, size_t keylen)
 {
@@ -178,7 +209,7 @@ int lan_identity_key(const char *ws_name, const char *cand_obj,
 
     /* the model only belongs to this Mac if it was registered under the
        same name as its Workstation entry (or there is no Workstation) */
-    if (cand_type[0] && (!ws_name[0] || strcasecmp(cand_obj, ws_name) == 0)) {
+    if (cand_type[0] && (!ws_name[0] || same_mac_name(cand_obj, ws_name))) {
         snprintf(model, sizeof(model), "%s", cand_type);
     }
 

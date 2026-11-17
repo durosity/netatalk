@@ -71,6 +71,14 @@ int main(void)
     check_key("G3 AIO", "G3 AIO", "  Power Macintosh", "G3 AIO:Power Macintosh");
     /* System 6: Responder entry only (Chooser name : model) */
     check_key("", "Mike", "Macintosh II", "Mike:Macintosh II");
+    /* Responder re-registered with a conflict suffix (seen on an LC 520) */
+    check_key("Mac LC 520", "Mac LC 520-1", "Macintosh LC 520",
+              "Mac LC 520:Macintosh LC 520");
+    check_key("Mac LC 520", "Mac LC 520-12", "Macintosh LC 520",
+              "Mac LC 520:Macintosh LC 520");
+    /* but not a different name that happens to share the start */
+    check_key("Mac LC", "Mac LC 520", "Macintosh LC 520", "Mac LC:");
+    check_key("Mac LC 520", "Mac LC 520-x", "Macintosh LC 520", "Mac LC 520:");
     /* Responder name differs from Workstation name: no model */
     check_key("Studio", "Other", "Macintosh SE", "Studio:");
     /* nothing registered */
